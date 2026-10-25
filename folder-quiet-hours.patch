@@ -118,7 +118,7 @@ index 242e45b3..7387cbb0 100644
 +"FolderQuietHours.EditFolderFooter" = "Keep the chats in this folder silent on a schedule, for example at night and on weekends.";
 diff --git a/docs/folder-quiet-hours/README.md b/docs/folder-quiet-hours/README.md
 new file mode 100644
-index 00000000..f5006ca0
+index 00000000..a2ea968b
 --- /dev/null
 +++ b/docs/folder-quiet-hours/README.md
 @@ -0,0 +1,65 @@
@@ -135,7 +135,7 @@ index 00000000..f5006ca0
 +   - a switch;
 +   - the days, as a row of buttons;
 +   - **All Day**, or **From** and **To** picked with the app's time-of-day wheel. A window may run past midnight: *From 19:00 To 09:00* ends the next morning, and the screen says so;
-+   - **Add a Set of Hours** for another window, for example *Weekends, All Day* — Telegram's own wording from Business Hours. Turning quiet hours on already creates the first window, so the button only adds more.
++   - **Add a Set of Hours** for another window — Telegram's own wording from Business Hours. Turning quiet hours on already creates the first window, so the button only adds more. A new set starts as *All Day* with no days chosen: picking *Sat* and *Sun* makes the weekend quiet. A set left without days is not saved.
 +3. Leaving the screen saves it, and a toast confirms: *Quiet hours for **Work**: Every Day, 19:00 – 09:00; Weekends, All Day*. Opened from **Edit Folder**, the change waits for **Done** like the folder's other settings, and **Cancel** drops it.
 +4. While quiet hours are on, the folder's chats stay silent: no sound, vibration or banner in the app, pushes go straight to Notification Center without sound or banner, and their unread badges and the folder tab's badge turn grey like a muted folder's — without the mute icon, since the chats are not muted. Mentions and replies stay silent too, unlike in a muted chat: quiet hours mean no notifications at all, as with schedules in Teams and Slack.
 +
@@ -2103,10 +2103,10 @@ index 00000000..07ee128d
 +}
 diff --git a/submodules/TelegramUI/Components/Settings/FolderNotificationScheduleScreen/Sources/FolderNotificationScheduleScreen.swift b/submodules/TelegramUI/Components/Settings/FolderNotificationScheduleScreen/Sources/FolderNotificationScheduleScreen.swift
 new file mode 100644
-index 00000000..bbef6daa
+index 00000000..fc41e985
 --- /dev/null
 +++ b/submodules/TelegramUI/Components/Settings/FolderNotificationScheduleScreen/Sources/FolderNotificationScheduleScreen.swift
-@@ -0,0 +1,723 @@
+@@ -0,0 +1,725 @@
 +import Foundation
 +import UIKit
 +import Display
@@ -2198,7 +2198,7 @@ index 00000000..bbef6daa
 +            self.isAllDay = isAllDay
 +        }
 +
-+        // A first set of quiet hours covers the night; an added one keeps the weekend quiet.
++        // A first set of quiet hours covers the night.
 +        static let defaultStartMinute: Int32 = 22 * 60
 +        static let defaultEndMinute: Int32 = 8 * 60
 +
@@ -2262,8 +2262,9 @@ index 00000000..bbef6daa
 +            self.scrollView.setContentOffset(CGPoint(), animated: true)
 +        }
 +
++        // A set still without days covers nothing and is not saved.
 +        var currentEntry: FolderNotificationScheduleEntry {
-+            return FolderNotificationScheduleEntry(isEnabled: self.isEnabled, schedules: self.windows.map(\.schedule))
++            return FolderNotificationScheduleEntry(isEnabled: self.isEnabled, schedules: self.windows.filter { !$0.days.isEmpty }.map(\.schedule))
 +        }
 +
 +        // Saves each change once, when the screen has gone: back, or a chat opened on top of it.
@@ -2713,7 +2714,8 @@ index 00000000..bbef6daa
 +                                }
 +                                let id = self.nextWindowId
 +                                self.nextWindowId += 1
-+                                self.windows.append(Window(id: id, days: .weekends, startMinute: Window.defaultStartMinute, endMinute: Window.defaultEndMinute, isAllDay: true))
++                                // All Day, the usual reason for another set (days off); the days are the user's choice.
++                                self.windows.append(Window(id: id, days: [], startMinute: Window.defaultStartMinute, endMinute: Window.defaultEndMinute, isAllDay: true))
 +                                self.state?.updated(transition: .spring(duration: 0.4))
 +                            }
 +                        )))
