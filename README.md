@@ -64,7 +64,7 @@ patch adds to the repository and which is repeated below.
    - a switch;
    - the days, as a row of buttons;
    - **All Day**, or **From** and **To** picked with the app's time-of-day wheel. A window may run past midnight: *From 19:00 To 09:00* ends the next morning, and the screen says so;
-   - **Add a Set of Hours** for another window, for example *Weekends, All Day* — Telegram's own wording from Business Hours. Turning quiet hours on already creates the first window, so the button only adds more.
+   - **Add a Set of Hours** for another window — Telegram's own wording from Business Hours. Turning quiet hours on already creates the first window, so the button only adds more. A new set starts as *All Day* with no days chosen: picking *Sat* and *Sun* makes the weekend quiet. A set left without days is not saved.
 3. Leaving the screen saves it, and a toast confirms: *Quiet hours for **Work**: Every Day, 19:00 – 09:00; Weekends, All Day*. Opened from **Edit Folder**, the change waits for **Done** like the folder's other settings, and **Cancel** drops it.
 4. While quiet hours are on, the folder's chats stay silent: no sound, vibration or banner in the app, pushes go straight to Notification Center without sound or banner, and their unread badges and the folder tab's badge turn grey like a muted folder's — without the mute icon, since the chats are not muted. Mentions and replies stay silent too, unlike in a muted chat: quiet hours mean no notifications at all, as with schedules in Teams and Slack.
 
