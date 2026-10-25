@@ -1,0 +1,3159 @@
+diff --git a/Telegram/NotificationService/Sources/NotificationService.swift b/Telegram/NotificationService/Sources/NotificationService.swift
+index 5a2e16b5..014e6b59 100644
+--- a/Telegram/NotificationService/Sources/NotificationService.swift
++++ b/Telegram/NotificationService/Sources/NotificationService.swift
+@@ -519,6 +519,8 @@ private struct NotificationContent: CustomStringConvertible {
+     var userInfo: [AnyHashable: Any] = [:]
+     var attachments: [UNNotificationAttachment] = []
+     var silent = false
++    /// The chat is in a folder whose quiet hours are on: delivered without sound or banner.
++    var isQuietHours = false
+     /// The account this notification was delivered to, set only while more than one is signed
+     /// in (see `notificationRecipientAccountName`).
+     var recipientAccountName: String?
+@@ -725,6 +727,14 @@ private struct NotificationContent: CustomStringConvertible {
+             }
+         }
+ 
++        if self.isQuietHours {
++            // Folder quiet hours: Notification Center only, like a notification a Focus silences.
++            content.sound = nil
++            if #available(iOS 15.0, *) {
++                content.interruptionLevel = .passive
++            }
++        }
++
+         return content
+     }
+ }
+@@ -962,8 +972,12 @@ private final class NotificationServiceHandler {
+                 
+                 let accountPeerId = stateManager.accountPeerId
+                 
+-                let settings = stateManager.postbox.transaction { transaction -> NotificationSoundList? in
+-                    return _internal_cachedNotificationSoundList(transaction: transaction)
++                // Folder quiet hours ride along in the same transaction: each one takes the database lock.
++                let settings = stateManager.postbox.transaction { transaction -> (NotificationSoundList?, ChatListFolderNotificationScheduleSettings?) in
++                    return (
++                        _internal_cachedNotificationSoundList(transaction: transaction),
++                        transaction.getPreferencesEntry(key: ApplicationSpecificPreferencesKeys.chatListFolderNotificationSchedules)?.get(ChatListFolderNotificationScheduleSettings.self)
++                    )
+                 }
+ 
+                 // The extension has a postbox but no AccountContext, so the backend
+@@ -995,7 +1009,10 @@ private final class NotificationServiceHandler {
+                     settings,
+                     lottieSettings,
+                     recipientAccountName
+-                ) |> deliverOn(strongSelf.queue)).start(next: { notificationsKey, notificationSoundList, lottieSettings, recipientAccountName in
++                ) |> deliverOn(strongSelf.queue)).start(next: { notificationsKey, soundListAndQuietHours, lottieSettings, recipientAccountName in
++                    let (notificationSoundList, folderNotificationSchedules) = soundListAndQuietHours
++                    // Folder quiet hours: the folders whose windows are on now; the chat is checked against them below.
++                    let quietFolderIds = folderNotificationSchedules?.activeFolderIds(at: Date(), calendar: Calendar.current) ?? Set()
+                     guard let strongSelf = self else {
+                         let content = NotificationContent(isLockedMessage: nil)
+                         updateCurrentContent(content)
+@@ -2081,10 +2098,17 @@ private final class NotificationServiceHandler {
+                                 }
+ 
+                                 let pollWithUpdatedContent: Signal<(NotificationContent, Media?), NoError>
+-                                if interactionAuthorId != nil || messageId != nil {
++                                if interactionAuthorId != nil || messageId != nil || !quietFolderIds.isEmpty {
+                                     pollWithUpdatedContent = stateManager.postbox.transaction { transaction -> (NotificationContent, Media?) in
+                                         var content = initialContent
+                                         
++                                        // By the chat (a secret chat's push has no message id), and stored at once, so that a push
++                                        // the extension runs out of time on is still silent.
++                                        if !quietFolderIds.isEmpty, _internal_chatListFiltersIncludePeer(transaction: transaction, filterIds: quietFolderIds, peerId: peerId, accountPeerId: stateManager.accountPeerId) {
++                                            content.isQuietHours = true
++                                            updateCurrentContent(content)
++                                        }
++                                        
+                                         if let interactionAuthorId = interactionAuthorId {
+                                             if inAppNotificationSettings.displayNameOnLockscreen, var peer = transaction.getPeer(interactionAuthorId) {
+                                                 if let channel = peer as? TelegramChannel, channel.isMonoForum, let linkedMonoforumId = channel.linkedMonoforumId, let mainChannel = transaction.getPeer(linkedMonoforumId) {
+@@ -2142,6 +2166,12 @@ private final class NotificationServiceHandler {
+                                         return stateManager.postbox.transaction { transaction -> (NotificationContent, Media?) in
+                                             var content = content
+                                             
++                                            // A chat that was new to the database before the poll is known now.
++                                            if !content.isQuietHours, !quietFolderIds.isEmpty, _internal_chatListFiltersIncludePeer(transaction: transaction, filterIds: quietFolderIds, peerId: peerId, accountPeerId: stateManager.accountPeerId) {
++                                                content.isQuietHours = true
++                                                updateCurrentContent(content)
++                                            }
++                                            
+                                             var parsedMedia: Media?
+                                             if let messageId, let message = transaction.getMessage(messageId), !message.containsSecretMedia, !message.attributes.contains(where: { $0 is MediaSpoilerMessageAttribute }) {
+                                                 if let media = message.media.first {
+diff --git a/Telegram/Telegram-iOS/en.lproj/Localizable.strings b/Telegram/Telegram-iOS/en.lproj/Localizable.strings
+index 242e45b3..7387cbb0 100644
+--- a/Telegram/Telegram-iOS/en.lproj/Localizable.strings
++++ b/Telegram/Telegram-iOS/en.lproj/Localizable.strings
+@@ -17243,3 +17243,26 @@ Error: %8$@";
+ "Gift.Delete.Title" = "Delete Gift";
+ "Gift.Delete.Text" = "Do you want to delete this gift?\n\nIt will disappear from your profile and can't be restored.";
+ "Gift.Delete.Success" = "Gift Deleted";
++
++"FolderQuietHours.MenuItem" = "Quiet Hours";
++"FolderQuietHours.Title" = "Quiet Hours";
++"FolderQuietHours.Text" = "Chats in {folder} stay silent during these hours. Notifications come back on their own when quiet hours end.";
++"FolderQuietHours.MainToggle" = "Quiet Hours";
++"FolderQuietHours.AllDay" = "All Day";
++"FolderQuietHours.From" = "From";
++"FolderQuietHours.To" = "To";
++"FolderQuietHours.NextDay" = "next day";
++"FolderQuietHours.NightFooter" = "Starts on the selected days and ends the next day at {time}.";
++"FolderQuietHours.Remove" = "Remove";
++"FolderQuietHours.Add" = "Add a Set of Hours";
++"FolderQuietHours.AddFooter" = "Add another time, for example to keep weekends quiet all day.";
++"FolderQuietHours.EveryDay" = "Every Day";
++"FolderQuietHours.Weekdays" = "Weekdays";
++"FolderQuietHours.Weekends" = "Weekends";
++"FolderQuietHours.StatusUntil" = "Until {time}";
++"FolderQuietHours.StatusFrom" = "From {time}";
++"FolderQuietHours.StatusAlways" = "Always";
++"FolderQuietHours.Off" = "Off";
++"FolderQuietHours.ToastSet" = "Quiet hours for {folder}: {schedule}";
++"FolderQuietHours.ToastOff" = "Quiet hours for {folder} are off";
++"FolderQuietHours.EditFolderFooter" = "Keep the chats in this folder silent on a schedule, for example at night and on weekends.";
+diff --git a/docs/folder-quiet-hours/README.md b/docs/folder-quiet-hours/README.md
+new file mode 100644
+index 00000000..f5006ca0
+--- /dev/null
++++ b/docs/folder-quiet-hours/README.md
+@@ -0,0 +1,65 @@
++# Quiet Hours for chat folders
++
++Quiet hours let a chat folder go silent on a schedule: the **Work** folder stops notifying in the evening and on weekends, **Personal** stays quiet during the working day. Notifications come back on their own when quiet hours end.
++
++Telegram already mutes a whole folder with one tap (**Mute All** in the folder tab's menu), but only until it is unmuted by hand. People keep asking for a folder mute that ends by itself or follows a schedule ([bugs.telegram.org/c/2411](https://bugs.telegram.org/c/2411)). Quiet Hours is that schedule.
++
++## The flow
++
++1. Press and hold a folder tab. The menu has **Quiet Hours** right after **Mute All**. Its second line says where they stand: *Until 09:00* while quiet hours are on, *From 19:00* while they are off (with the weekday when that is a day or more away). The same goes into the folder's **Edit Folder** row.
++2. The Quiet Hours screen (also reachable from **Edit Folder → Quiet Hours**):
++   - a switch;
++   - the days, as a row of buttons;
++   - **All Day**, or **From** and **To** picked with the app's time-of-day wheel. A window may run past midnight: *From 19:00 To 09:00* ends the next morning, and the screen says so;
++   - **Add a Set of Hours** for another window, for example *Weekends, All Day* — Telegram's own wording from Business Hours. Turning quiet hours on already creates the first window, so the button only adds more.
++3. Leaving the screen saves it, and a toast confirms: *Quiet hours for **Work**: Every Day, 19:00 – 09:00; Weekends, All Day*. Opened from **Edit Folder**, the change waits for **Done** like the folder's other settings, and **Cancel** drops it.
++4. While quiet hours are on, the folder's chats stay silent: no sound, vibration or banner in the app, pushes go straight to Notification Center without sound or banner, and their unread badges and the folder tab's badge turn grey like a muted folder's — without the mute icon, since the chats are not muted. Mentions and replies stay silent too, unlike in a muted chat: quiet hours mean no notifications at all, as with schedules in Teams and Slack.
++
++## How it works
++
++Quiet hours are a **layer over the chats' own notification settings, which they never change**. A chat's mute, its exceptions in Settings → Notifications and its look on the account's other devices stay exactly as the user set them. While a window is on, the folder's chats simply behave as if muted:
++
++| Piece | Where |
++| --- | --- |
++| Weekly windows and their math (days, overnight windows, all day, next change, daylight saving) | `submodules/FolderNotificationSchedule/Sources/FolderNotificationSchedule.swift` |
++| Stored settings: each folder's quiet hours | `submodules/TelegramUIPreferences/Sources/ChatListFolderNotificationScheduleSettings.swift` |
++| Whether a folder shows a given chat, by its rules (`chatListFiltersIncludePeer`, from the database: `_internal_chatListFiltersIncludePeer`); the folder rules themselves (`chatListFilterPredicate`, moved here from ChatListUI so the extension can use them) | `submodules/TelegramCore/Sources/TelegramEngine/Peers/ChatListFiltering.swift` |
++| Whether a chat is quiet now (`FolderNotificationScheduleManager.isQuiet`), which folders are (`folderNotificationScheduleActiveFolderIds`) | `submodules/ChatListUI/Sources/FolderNotificationSchedule/FolderNotificationScheduleManager.swift` |
++| The Quiet Hours screen, the day buttons, the schedule text | `submodules/TelegramUI/Components/Settings/FolderNotificationScheduleScreen/` |
++| The folder tab menu item, the toast, the grey tab badge | `ChatListController.swift`, `ChatListController+FolderNotificationSchedule.swift` |
++| The grey unread badge of a quiet chat (`isQuiet`, checked per row like the folder tags) | `ChatListNode.swift`, `ChatListItem.swift` |
++| The Edit Folder row | `ChatListFilterPresetController.swift` |
++| No sound or banner in the app | `submodules/TelegramUI/Sources/ApplicationContext.swift` (in-app notifications) |
++| Silent pushes | `Telegram/NotificationService/Sources/NotificationService.swift`; for another account's push while the app is open, `AppDelegate.swift` |
++
++**Which chats.** Whether a message's chat is in a quiet folder is decided when the message arrives, from the database, by the folder's own rules: its chat types, included and excluded chats, archived chats when the folder includes them, and its pinned chats wherever they are, as the folder shows them. Being muted or read does not take a chat out, so a folder that shows only unread chats keeps its quiet hours for all of them. Nothing is precomputed, so a chat that has just joined a folder through its rules — a stranger writing to a *Non-Contacts* folder, a new group in *Groups* — is quiet from its first message.
++
++**Chats in several folders.** A chat is quiet while quiet hours are on in *any* of its folders — the way **Mute All** of one folder already silences a chat that is also in another. The opposite rule (quiet only when all of its folders are quiet) was rejected: folders such as *Personal* built from the *Contacts* category contain most work contacts too, so work chats would keep ringing after hours.
++
++**Pushes.** The Notification Service Extension, which already runs for every Telegram push, reads the schedules in the database transaction it already runs, checks the chat against the quiet folders' rules — before it fetches the message, and again after, for a chat the device did not know yet — and delivers the push without sound or banner (`.passive`), straight into Notification Center. Telegram's own build carries the `com.apple.developer.usernotifications.filtering` entitlement and could drop such a push entirely.
++
++**Time.** Quiet hours follow the device's clock, like alarms and Focus: 19:00 stays 19:00 after travelling or a clock change.
++
++## Why not mute the chats
++
++The first version set the server mute on each chat for the length of the window and gave the old setting back afterwards. It was dropped: it made folders that hide muted chats go empty in the evening, filled Settings → Notifications → Exceptions, showed chats as muted on every device, sent one request per chat twice a day, and needed delicate bookkeeping to give back exactly what it took. With server support (below) the server simply does not send the pushes, which is what this layer does on the device.
++
++## Limits of the prototype
++
++- **The schedule lives on this device**, and only this device keeps quiet hours. The server has no notification settings for folders, so Telegram Desktop and other phones of the account still notify.
++- A single chat cannot yet be exempted from its folder's quiet hours (for example a chat that is also in *Family*); taking it out of the folder does it.
++- The app icon badge and the Chats tab counter still count the quiet chats' unread messages: Postbox counts them by the chats' mute settings, which quiet hours do not change.
++- A chat list row does not know whether its chat is archived. In a folder tab that also shows archived chats, an archived chat's badge follows the rules for unarchived chats, as Telegram's folder tags do, and so do the topics of an archived forum; their notifications follow where the chat really is. Chat search results keep the usual badge colours.
++- A folder tab's badge turns grey for the folder's own quiet hours. A folder that is not quiet itself keeps a blue badge even if all of its unread chats are quiet through another folder.
++- Pushes are kept silent by the notification service extension. If iOS does not run it at all, the push shows as the server sent it; story notifications are not covered.
++- Quiet hours are kept by folder id. If another device deletes a folder and creates a new one under the same id while this app is not running, the new folder inherits them.
++
++## Production path
++
++Store the schedule with the folder on the server — for example a `quiet_hours` field in `dialogFilter`, reusing the `businessWorkHours` / `businessWeeklyOpen` types Telegram Business already has — and let the server skip pushes for the folder's chats during the windows, on every device. The client pieces above stay: the screen, the menu item, the Edit Folder row and the grey badge do not change, and the manager becomes the offline fallback. Android and Desktop already have the same folder tab menu with **Mute All** (`FilterMuteAll` in `DialogsActivity.java`, `chat_filters_tabs_strip.cpp`).
++
++## Tests
++
++- `submodules/FolderNotificationSchedule/Tests` — 16 tests: 1,536 schedules checked at every minute of the week against what a window means (every set of days with every kind of window, starts and ends at the edges of the day and the hour); same-day and overnight windows, all-day, week wrap, unions of windows; the next change compared with a minute-by-minute walk across six time zones around the 2026 clock changes; windows that begin or end right where the clocks change (including Santiago, Scoresbysund and Lord Howe, whose clocks change at midnight, at 23:00 or by half an hour); decoding damaged values.
++- `submodules/TelegramCore/Tests/ChatListFiltersInclusionTests.swift` — which chats a folder's quiet hours silence: chat types, included, excluded and pinned chats, archived chats, muted and read chats staying in, secret chats by their user, a chat in several folders.
++- Bazel: `./build-input/bazel-9.2.0-darwin-arm64 test //submodules/FolderNotificationSchedule:FolderNotificationScheduleTests` (host) and `//submodules/TelegramCore:TelegramCoreTests` (simulator).
+diff --git a/submodules/ChatListUI/BUILD b/submodules/ChatListUI/BUILD
+index af464d40..3b379f1e 100644
+--- a/submodules/ChatListUI/BUILD
++++ b/submodules/ChatListUI/BUILD
+@@ -107,6 +107,8 @@ swift_library(
+         "//submodules/TelegramUI/Components/Settings/NewSessionInfoScreen",
+         "//submodules/TelegramUI/Components/Settings/PeerNameColorItem",
+         "//submodules/TelegramUI/Components/Settings/BirthdayPickerScreen",
++        "//submodules/TelegramUI/Components/Settings/FolderNotificationScheduleScreen",
++        "//submodules/FolderNotificationSchedule",
+         "//submodules/Components/MultilineTextComponent",
+         "//submodules/Components/MultilineTextWithEntitiesComponent",
+         "//submodules/TelegramUI/Components/Stories/StoryStealthModeSheetScreen",
+diff --git a/submodules/ChatListUI/Sources/ChatListController.swift b/submodules/ChatListUI/Sources/ChatListController.swift
+index 5bdff8a6..668198f4 100644
+--- a/submodules/ChatListUI/Sources/ChatListController.swift
++++ b/submodules/ChatListUI/Sources/ChatListController.swift
+@@ -63,6 +63,8 @@ import GlobalControlPanelsContext
+ import AlertComponent
+ import AlertHeaderComponent
+ import AvatarComponent
++import FolderNotificationSchedule
++import FolderNotificationScheduleScreen
+ 
+ private final class ContextControllerContentSourceImpl: ContextControllerContentSource {
+     let controller: ViewController
+@@ -1013,13 +1015,16 @@ public class ChatListControllerImpl: TelegramBaseController, ChatListController
+             queue: Queue.mainQueue(),
+             self.context.engine.peers.currentChatListFilters(),
+             self.context.engine.data.get(
+-                TelegramEngine.EngineData.Item.Configuration.UserLimits(isPremium: true)
++                TelegramEngine.EngineData.Item.Configuration.UserLimits(isPremium: true),
++                TelegramEngine.EngineData.Item.Configuration.ApplicationSpecificPreference(key: ApplicationSpecificPreferencesKeys.chatListFolderNotificationSchedules)
+             ),
+             filterPeersAreMuted
+-        ).startStandalone(next: { [weak self] filters, premiumLimits, filterPeersAreMuted in
++        ).startStandalone(next: { [weak self] filters, limitsAndSchedules, filterPeersAreMuted in
+             guard let self else {
+                 return
+             }
++            let (_, schedulesEntry) = limitsAndSchedules
++            let folderSchedules = schedulesEntry?.get(ChatListFolderNotificationScheduleSettings.self) ?? .default
+             var items: [ContextMenuItem] = []
+             if let id = id {
+                 items.append(.action(ContextMenuActionItem(text: self.presentationData.strings.ChatList_EditFolder, icon: { theme in
+@@ -1231,6 +1236,16 @@ public class ChatListControllerImpl: TelegramBaseController, ChatListController
+                                             })))
+                                         }
+                                         
++                                        let quietHoursEntry = folderSchedules.folder(id: filterId)?.entry
++                                        let quietHoursStatus = folderNotificationScheduleStatus(quietHoursEntry, at: Date(), calendar: Calendar.current, strings: self.presentationData.strings, dateTimeFormat: self.presentationData.dateTimeFormat)
++                                        items.append(.action(ContextMenuActionItem(text: self.presentationData.strings.FolderQuietHours_MenuItem, textLayout: quietHoursStatus.flatMap { .secondLineWithValue($0) } ?? .singleLine, icon: { theme in
++                                            return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/Schedule"), color: theme.contextMenu.primaryColor)
++                                        }, action: { [weak self] c, _ in
++                                            c?.dismiss(completion: { [weak self] in
++                                                self?.openFolderNotificationSchedule(filterId: filterId, title: title)
++                                            })
++                                        })))
++                                        
+                                         if !data.includePeers.peers.isEmpty && data.categories.isEmpty && !data.excludeRead && !data.excludeMuted && !data.excludeArchived && data.excludePeers.isEmpty {
+                                             items.append(.action(ContextMenuActionItem(text: self.presentationData.strings.ChatList_ContextMenuShare, textColor: .primary, badge: nil, icon: { theme in
+                                                 return generateTintedImage(image: UIImage(bundleImageName: "Chat/Context Menu/Link"), color: theme.contextMenu.primaryColor)
+@@ -4037,9 +4052,10 @@ public class ChatListControllerImpl: TelegramBaseController, ChatListController
+         self.filterDisposable.set((combineLatest(queue: .mainQueue(),
+             filterItems,
+             self.context.account.postbox.peerView(id: self.context.account.peerId),
+-            self.context.engine.data.get(TelegramEngine.EngineData.Item.Configuration.UserLimits(isPremium: false))
++            self.context.engine.data.get(TelegramEngine.EngineData.Item.Configuration.UserLimits(isPremium: false)),
++            folderNotificationScheduleActiveFolderIds(engine: self.context.engine)
+         )
+-        |> deliverOnMainQueue).startStrict(next: { [weak self] countAndFilterItems, peerView, limits in
++        |> deliverOnMainQueue).startStrict(next: { [weak self] countAndFilterItems, peerView, limits, quietFolderIds in
+             guard let strongSelf = self else {
+                 return
+             }
+@@ -4059,7 +4075,8 @@ public class ChatListControllerImpl: TelegramBaseController, ChatListController
+                             filterItems.append(.all(unreadCount: 0))
+                         }
+                     case let .filter(id, title, _, _):
+-                        filterItems.append(.filter(id: id, text: title, unread: ChatListFilterTabEntryUnreadCount(value: unreadCount, hasUnmuted: hasUnmutedUnread)))
++                        // A folder in quiet hours shows its badge grey, like a muted one.
++                        filterItems.append(.filter(id: id, text: title, unread: ChatListFilterTabEntryUnreadCount(value: unreadCount, hasUnmuted: hasUnmutedUnread && !quietFolderIds.contains(id))))
+                 }
+             }
+             
+diff --git a/submodules/ChatListUI/Sources/ChatListFilterPresetController.swift b/submodules/ChatListUI/Sources/ChatListFilterPresetController.swift
+index d466ef42..4df1318e 100644
+--- a/submodules/ChatListUI/Sources/ChatListFilterPresetController.swift
++++ b/submodules/ChatListUI/Sources/ChatListFilterPresetController.swift
+@@ -8,6 +8,8 @@ import PresentationDataUtils
+ import ItemListUI
+ import AccountContext
+ import TelegramUIPreferences
++import FolderNotificationSchedule
++import FolderNotificationScheduleScreen
+ import ItemListPeerItem
+ import ItemListPeerActionItem
+ import AvatarNode
+@@ -54,6 +56,7 @@ private final class ChatListFilterPresetControllerArguments {
+     let peerContextAction: (EnginePeer, ASDisplayNode, ContextGesture?, CGPoint?) -> Void
+     let updateTagColor: (PeerNameColor?) -> Void
+     let openTagColorPremium: () -> Void
++    let openQuietHours: () -> Void
+     
+     init(
+         context: AccountContext,
+@@ -77,7 +80,8 @@ private final class ChatListFilterPresetControllerArguments {
+         linkContextAction: @escaping (ExportedChatFolderLink?, ASDisplayNode, ContextGesture?) -> Void,
+         peerContextAction: @escaping (EnginePeer, ASDisplayNode, ContextGesture?, CGPoint?) -> Void,
+         updateTagColor: @escaping (PeerNameColor?) -> Void,
+-        openTagColorPremium: @escaping () -> Void
++        openTagColorPremium: @escaping () -> Void,
++        openQuietHours: @escaping () -> Void
+     ) {
+         self.context = context
+         self.updateState = updateState
+@@ -101,6 +105,7 @@ private final class ChatListFilterPresetControllerArguments {
+         self.peerContextAction = peerContextAction
+         self.updateTagColor = updateTagColor
+         self.openTagColorPremium = openTagColorPremium
++        self.openQuietHours = openQuietHours
+     }
+ }
+ 
+@@ -111,6 +116,7 @@ private enum ChatListFilterPresetControllerSection: Int32 {
+     case excludePeers
+     case inviteLinks
+     case tagColor
++    case quietHours
+ }
+ 
+ private enum ChatListFilterPresetEntryStableId: Hashable {
+@@ -126,6 +132,8 @@ private enum ChatListFilterPresetEntryStableId: Hashable {
+     case tagColorHeader
+     case tagColor
+     case tagColorFooter
++    case quietHours
++    case quietHoursFooter
+ }
+ 
+ private struct ChatListFilterPresetEntrySortId: Comparable {
+@@ -252,6 +260,8 @@ private enum ChatListFilterPresetEntry: ItemListNodeEntry {
+     case tagColorHeader(name: ChatFolderTitle, color: PeerNameColors.Colors?, isPremium: Bool)
+     case tagColor(colors: PeerNameColors, currentColor: PeerNameColor?, isPremium: Bool)
+     case tagColorFooter
++    case quietHours(title: String, value: String)
++    case quietHoursFooter(String)
+     
+     var section: ItemListSectionId {
+         switch self {
+@@ -267,6 +277,8 @@ private enum ChatListFilterPresetEntry: ItemListNodeEntry {
+             return ChatListFilterPresetControllerSection.inviteLinks.rawValue
+         case .tagColorHeader, .tagColor, .tagColorFooter:
+             return ChatListFilterPresetControllerSection.tagColor.rawValue
++        case .quietHours, .quietHoursFooter:
++            return ChatListFilterPresetControllerSection.quietHours.rawValue
+         }
+     }
+     
+@@ -316,6 +328,10 @@ private enum ChatListFilterPresetEntry: ItemListNodeEntry {
+             return .index(15)
+         case .tagColorFooter:
+             return .index(16)
++        case .quietHours:
++            return .quietHours
++        case .quietHoursFooter:
++            return .quietHoursFooter
+         }
+     }
+     
+@@ -357,6 +373,10 @@ private enum ChatListFilterPresetEntry: ItemListNodeEntry {
+             return ChatListFilterPresetEntrySortId(section: 10, index: 1)
+         case .tagColorFooter:
+             return ChatListFilterPresetEntrySortId(section: 10, index: 2)
++        case .quietHours:
++            return ChatListFilterPresetEntrySortId(section: 10, index: 10)
++        case .quietHoursFooter:
++            return ChatListFilterPresetEntrySortId(section: 10, index: 11)
+         case .inviteLinkHeader:
+             return ChatListFilterPresetEntrySortId(section: 11, index: 0)
+         case .inviteLinkCreate:
+@@ -527,6 +547,12 @@ private enum ChatListFilterPresetEntry: ItemListNodeEntry {
+             )
+         case .tagColorFooter:
+             return ItemListTextItem(presentationData: presentationData, text: .plain(presentationData.strings.ChatListFilter_TagSectionFooter), sectionId: self.section)
++        case let .quietHours(title, value):
++            return ItemListDisclosureItem(presentationData: presentationData, systemStyle: .glass, title: title, label: value, labelStyle: .text, sectionId: self.section, style: .blocks, disclosureStyle: .arrow, action: {
++                arguments.openQuietHours()
++            })
++        case let .quietHoursFooter(text):
++            return ItemListTextItem(presentationData: presentationData, text: .plain(text), sectionId: self.section)
+         case .inviteLinkHeader:
+             return ItemListSectionHeaderItem(presentationData: presentationData, text: presentationData.strings.ChatListFilter_SectionShare, badge: nil, sectionId: self.section)
+         case let .inviteLinkCreate(hasLinks):
+@@ -564,6 +590,9 @@ private struct ChatListFilterPresetControllerState: Equatable {
+     var revealedItemId: ChatListFilterRevealedItemId?
+     var expandedSections: Set<FilterSection>
+     
++    // Quiet hours changed on this screen, saved with the folder on Done; nil while untouched.
++    var quietHours: FolderNotificationScheduleEntry? = nil
++    
+     var isComplete: Bool {
+         if self.name.text.isEmpty {
+             return false
+@@ -593,7 +622,7 @@ private struct ChatListFilterPresetControllerState: Equatable {
+     }
+ }
+ 
+-private func chatListFilterPresetControllerEntries(context: AccountContext, presentationData: PresentationData, isNewFilter: Bool, currentPreset: ChatListFilter?, state: ChatListFilterPresetControllerState, includePeers: [EngineRenderedPeer], excludePeers: [EngineRenderedPeer], isPremium: Bool, limit: Int32, inviteLinks: [ExportedChatFolderLink]?, hadLinks: Bool) -> [ChatListFilterPresetEntry] {
++private func chatListFilterPresetControllerEntries(context: AccountContext, presentationData: PresentationData, isNewFilter: Bool, currentPreset: ChatListFilter?, state: ChatListFilterPresetControllerState, includePeers: [EngineRenderedPeer], excludePeers: [EngineRenderedPeer], isPremium: Bool, limit: Int32, inviteLinks: [ExportedChatFolderLink]?, hadLinks: Bool, quietHours: FolderNotificationScheduleEntry?) -> [ChatListFilterPresetEntry] {
+     var entries: [ChatListFilterPresetEntry] = []
+     
+     if isNewFilter {
+@@ -687,6 +716,13 @@ private func chatListFilterPresetControllerEntries(context: AccountContext, pres
+     entries.append(.tagColor(colors: context.peerNameColors, currentColor: tagColor, isPremium: isPremium))
+     entries.append(.tagColorFooter)
+     
++    // Quiet hours belong to a saved folder: a folder being created has no id to attach them to yet.
++    if !isNewFilter {
++        let value = folderNotificationScheduleStatus(quietHours, at: Date(), calendar: Calendar.current, strings: presentationData.strings, dateTimeFormat: presentationData.dateTimeFormat) ?? presentationData.strings.FolderQuietHours_Off
++        entries.append(.quietHours(title: presentationData.strings.FolderQuietHours_Title, value: value))
++        entries.append(.quietHoursFooter(presentationData.strings.FolderQuietHours_EditFolderFooter))
++    }
++    
+     var hasLinks = false
+     if let inviteLinks, !inviteLinks.isEmpty {
+         hasLinks = true
+@@ -2000,6 +2036,27 @@ public func chatListFilterPresetController(context: AccountContext, currentPrese
+                 controller?.replace(with: c)
+             }
+             pushControllerImpl?(controller)
++        },
++        openQuietHours: {
++            let _ = (combineLatest(
++                updatedCurrentPreset |> take(1),
++                context.engine.data.get(TelegramEngine.EngineData.Item.Configuration.ApplicationSpecificPreference(key: ApplicationSpecificPreferencesKeys.chatListFolderNotificationSchedules))
++            )
++            |> deliverOnMainQueue).start(next: { currentPreset, quietHoursPreference in
++                guard let currentPreset, case let .filter(filterId, _, _, _) = currentPreset else {
++                    return
++                }
++                let state = stateValue.with { $0 }
++                let settings = quietHoursPreference?.get(ChatListFolderNotificationScheduleSettings.self) ?? .default
++                // Like the rest of this screen, the change waits for Done.
++                pushControllerImpl?(FolderNotificationScheduleScreen(context: context, folderTitle: state.name, initialEntry: state.quietHours ?? settings.folder(id: filterId)?.entry, presentationMode: .modal, completion: { updatedEntry in
++                    updateState { state in
++                        var state = state
++                        state.quietHours = updatedEntry
++                        return state
++                    }
++                }))
++            })
+         }
+     )
+         
+@@ -2008,6 +2065,12 @@ public func chatListFilterPresetController(context: AccountContext, currentPrese
+         let _ = (updatedCurrentPreset |> take(1) |> deliverOnMainQueue).start(next: { currentPreset in
+             let state = stateValue.with { $0 }
+             
++            if let quietHours = state.quietHours, let filterId = currentPreset?.id {
++                let _ = updateChatListFolderNotificationScheduleSettings(engine: context.engine, { settings in
++                    return settings.withUpdatedEntry(folderId: filterId, entry: quietHours)
++                }).startStandalone()
++            }
++            
+             var includePeers = ChatListFilterIncludePeers()
+             includePeers.setPeers(state.additionallyIncludePeers)
+             
+@@ -2076,10 +2139,11 @@ public func chatListFilterPresetController(context: AccountContext, currentPrese
+             TelegramEngine.EngineData.Item.Configuration.UserLimits(isPremium: true)
+         ),
+         sharedLinks.get(),
+-        updatedCurrentPreset
++        updatedCurrentPreset,
++        context.engine.data.subscribe(TelegramEngine.EngineData.Item.Configuration.ApplicationSpecificPreference(key: ApplicationSpecificPreferencesKeys.chatListFolderNotificationSchedules))
+     )
+     |> deliverOnMainQueue
+-    |> map { presentationData, stateWithPeers, peerView, premiumLimits, sharedLinks, currentPreset -> (ItemListControllerState, (ItemListNodeState, Any)) in
++    |> map { presentationData, stateWithPeers, peerView, premiumLimits, sharedLinks, currentPreset, quietHoursPreference -> (ItemListControllerState, (ItemListNodeState, Any)) in
+         var presentationData = presentationData
+ 
+         let updatedTheme = presentationData.theme.withModalBlocksBackground()
+@@ -2123,7 +2187,7 @@ public func chatListFilterPresetController(context: AccountContext, currentPrese
+         }
+         
+         let controllerState = ItemListControllerState(presentationData: ItemListPresentationData(presentationData), title: .text(currentPreset != nil ? presentationData.strings.ChatListFolder_TitleEdit : presentationData.strings.ChatListFolder_TitleCreate), leftNavigationButton: leftNavigationButton, rightNavigationButton: rightNavigationButton, backNavigationButton: ItemListBackButton(title: presentationData.strings.Common_Back), animateChanges: false)
+-        let listState = ItemListNodeState(presentationData: ItemListPresentationData(presentationData), entries: chatListFilterPresetControllerEntries(context: context, presentationData: presentationData, isNewFilter: currentPreset == nil, currentPreset: currentPreset, state: state, includePeers: includePeers, excludePeers: excludePeers, isPremium: isPremium, limit: premiumLimits.maxFolderChatsCount, inviteLinks: sharedLinks, hadLinks: hadLinks), style: .blocks, emptyStateItem: nil, crossfadeState: crossfadeAnimation, animateChanges: !skipStateAnimation)
++        let listState = ItemListNodeState(presentationData: ItemListPresentationData(presentationData), entries: chatListFilterPresetControllerEntries(context: context, presentationData: presentationData, isNewFilter: currentPreset == nil, currentPreset: currentPreset, state: state, includePeers: includePeers, excludePeers: excludePeers, isPremium: isPremium, limit: premiumLimits.maxFolderChatsCount, inviteLinks: sharedLinks, hadLinks: hadLinks, quietHours: state.quietHours ?? currentPreset.flatMap { quietHoursPreference?.get(ChatListFolderNotificationScheduleSettings.self)?.folder(id: $0.id)?.entry }), style: .blocks, emptyStateItem: nil, crossfadeState: crossfadeAnimation, animateChanges: !skipStateAnimation)
+         skipStateAnimation = false
+         
+         return (controllerState, (listState, arguments))
+@@ -2212,9 +2276,19 @@ public func chatListFilterPresetController(context: AccountContext, currentPrese
+         }
+     }
+     attemptNavigationImpl = { f in
+-        let _ = (updatedCurrentPreset |> take(1) |> deliverOnMainQueue).start(next: { currentPreset in
++        let _ = (combineLatest(
++            updatedCurrentPreset |> take(1),
++            context.engine.data.get(TelegramEngine.EngineData.Item.Configuration.ApplicationSpecificPreference(key: ApplicationSpecificPreferencesKeys.chatListFolderNotificationSchedules))
++        )
++        |> deliverOnMainQueue).start(next: { currentPreset, quietHoursPreference in
+             let state = stateValue.with { $0 }
+             if let currentPreset = currentPreset, case let .filter(currentId, currentTitle, currentEmoticon, currentData) = currentPreset {
++                if let quietHours = state.quietHours, quietHours != quietHoursPreference?.get(ChatListFolderNotificationScheduleSettings.self)?.folder(id: currentId)?.entry {
++                    displaySaveAlert()
++                    f(false)
++                    return
++                }
++                
+                 var currentPresetWithoutPinnedPeers = currentPreset
+                 
+                 var currentIncludePeers = ChatListFilterIncludePeers()
+diff --git a/submodules/ChatListUI/Sources/FolderNotificationSchedule/ChatListController+FolderNotificationSchedule.swift b/submodules/ChatListUI/Sources/FolderNotificationSchedule/ChatListController+FolderNotificationSchedule.swift
+new file mode 100644
+index 00000000..f3268267
+--- /dev/null
++++ b/submodules/ChatListUI/Sources/FolderNotificationSchedule/ChatListController+FolderNotificationSchedule.swift
+@@ -0,0 +1,67 @@
++import Foundation
++import UIKit
++import Display
++import SwiftSignalKit
++import TelegramCore
++import TelegramUIPreferences
++import AccountContext
++import UndoUI
++import TextFormat
++import FolderNotificationSchedule
++import FolderNotificationScheduleScreen
++
++extension ChatListControllerImpl {
++    // Opens a folder's quiet hours from the folder tab's menu.
++    func openFolderNotificationSchedule(filterId: Int32, title: ChatFolderTitle) {
++        let context = self.context
++        let _ = (context.engine.data.get(TelegramEngine.EngineData.Item.Configuration.ApplicationSpecificPreference(key: ApplicationSpecificPreferencesKeys.chatListFolderNotificationSchedules))
++        |> deliverOnMainQueue).startStandalone(next: { [weak self] entry in
++            guard let self else {
++                return
++            }
++            let settings = entry?.get(ChatListFolderNotificationScheduleSettings.self) ?? .default
++            let controller = FolderNotificationScheduleScreen(context: context, folderTitle: title, initialEntry: settings.folder(id: filterId)?.entry, completion: { [weak self] updatedEntry in
++                let _ = updateChatListFolderNotificationScheduleSettings(engine: context.engine, { settings in
++                    return settings.withUpdatedEntry(folderId: filterId, entry: updatedEntry)
++                }).startStandalone()
++                self?.presentFolderNotificationScheduleToast(title: title, entry: updatedEntry)
++            })
++            self.push(controller)
++        })
++    }
++
++    func presentFolderNotificationScheduleToast(title: ChatFolderTitle, entry: FolderNotificationScheduleEntry) {
++        let presentationData = self.presentationData
++        let template: String
++        let animation: String
++        let scale: CGFloat
++        let colors: [String: UIColor]
++        if let summary = folderNotificationScheduleSummary(entry, strings: presentationData.strings, dateTimeFormat: presentationData.dateTimeFormat) {
++            template = presentationData.strings.FolderQuietHours_ToastSet.replacingOccurrences(of: "{schedule}", with: summary)
++            animation = "anim_mute_for"
++            scale = 0.066
++            colors = [:]
++        } else {
++            template = presentationData.strings.FolderQuietHours_ToastOff
++            animation = "anim_profileunmute"
++            scale = 0.075
++            let iconColor: UIColor = .white
++            colors = [
++                "Middle.Group 1.Fill 1": iconColor,
++                "Top.Group 1.Fill 1": iconColor,
++                "Bottom.Group 1.Fill 1": iconColor,
++                "EXAMPLE.Group 1.Fill 1": iconColor,
++                "Line.Group 1.Stroke 1": iconColor
++            ]
++        }
++        let text = NSMutableAttributedString(string: template)
++        let folderNameRange = (text.string as NSString).range(of: "{folder}")
++        if folderNameRange.location != NSNotFound {
++            text.replaceCharacters(in: folderNameRange, with: "")
++            text.insert(title.attributedString(attributes: [
++                ChatTextInputAttributes.bold: true
++            ]), at: folderNameRange.location)
++        }
++        self.present(UndoOverlayController(presentationData: presentationData, content: .universalWithEntities(context: self.context, animation: animation, scale: scale, colors: colors, title: nil, text: text, animateEntities: title.enableAnimations, customUndoText: nil, timeout: nil), elevatedLayout: false, animateInAsReplacement: true, action: { _ in return false }), in: .current)
++    }
++}
+diff --git a/submodules/ChatListUI/Sources/FolderNotificationSchedule/FolderNotificationScheduleManager.swift b/submodules/ChatListUI/Sources/FolderNotificationSchedule/FolderNotificationScheduleManager.swift
+new file mode 100644
+index 00000000..e516d4ba
+--- /dev/null
++++ b/submodules/ChatListUI/Sources/FolderNotificationSchedule/FolderNotificationScheduleManager.swift
+@@ -0,0 +1,134 @@
++import Foundation
++import UIKit
++import SwiftSignalKit
++import TelegramCore
++import TelegramUIPreferences
++import FolderNotificationSchedule
++
++// Folder quiet hours in the running app.
++//
++// Quiet hours are a layer over the chats' own notification settings, which they never change: while a
++// folder's window is on, its chats behave as if muted — no sound, vibration or banner in the app
++// (`isQuiet(peerId:)`, asked by the app's in-app notifications), silent pushes (the notification service
++// extension asks the same of the database) and a grey tab badge. A chat in several folders is quiet while
++// any of them is. Which chats a folder has is decided when the notification arrives, by the folder's rules
++// at that moment, so a chat that has just joined a folder through its rules (a new group in a "Groups"
++// folder) is quiet as well.
++public final class FolderNotificationScheduleManager {
++    private let engine: TelegramEngine
++    private var cleanupDisposable: Disposable?
++
++    public init(engine: TelegramEngine) {
++        self.engine = engine
++
++        // The quiet hours of a deleted folder go with it, but only once the folders have come from the
++        // server: an empty local list would read as "every folder deleted".
++        self.cleanupDisposable = (combineLatest(
++            engine.peers.updatedChatListFiltersInfo(),
++            engine.data.subscribe(TelegramEngine.EngineData.Item.Configuration.ApplicationSpecificPreference(key: ApplicationSpecificPreferencesKeys.chatListFolderNotificationSchedules))
++        )
++        |> mapToSignal { filtersInfo, entry -> Signal<Never, NoError> in
++            let settings = entry?.get(ChatListFolderNotificationScheduleSettings.self) ?? .default
++            let existingFolderIds = Set(filtersInfo.filters.map(\.id))
++            if !filtersInfo.synchronized || settings.folders.allSatisfy({ existingFolderIds.contains($0.id) }) {
++                return .complete()
++            }
++            return updateChatListFolderNotificationScheduleSettings(engine: engine, { settings in
++                var settings = settings
++                settings.folders.removeAll(where: { !existingFolderIds.contains($0.id) })
++                return settings
++            })
++        }).startStrict()
++    }
++
++    deinit {
++        self.cleanupDisposable?.dispose()
++    }
++
++    // Whether a message from this chat should stay silent now.
++    public func isQuiet(peerId: EnginePeer.Id) -> Signal<Bool, NoError> {
++        let engine = self.engine
++        return engine.data.get(TelegramEngine.EngineData.Item.Configuration.ApplicationSpecificPreference(key: ApplicationSpecificPreferencesKeys.chatListFolderNotificationSchedules))
++        |> mapToSignal { entry -> Signal<Bool, NoError> in
++            let settings = entry?.get(ChatListFolderNotificationScheduleSettings.self) ?? .default
++            let activeFolderIds = settings.activeFolderIds(at: Date(), calendar: Calendar.current)
++            if activeFolderIds.isEmpty {
++                return .single(false)
++            }
++            return engine.peers.chatListFiltersIncludePeer(filterIds: activeFolderIds, peerId: peerId)
++        }
++    }
++}
++
++// Which of the account's folders are in quiet hours, updated when a window begins or ends.
++func folderNotificationScheduleActiveFolderIds(engine: TelegramEngine) -> Signal<Set<Int32>, NoError> {
++    return engine.data.subscribe(TelegramEngine.EngineData.Item.Configuration.ApplicationSpecificPreference(key: ApplicationSpecificPreferencesKeys.chatListFolderNotificationSchedules))
++    |> map { entry -> [Int32: FolderNotificationScheduleEntry] in
++        let settings = entry?.get(ChatListFolderNotificationScheduleSettings.self) ?? .default
++        var result: [Int32: FolderNotificationScheduleEntry] = [:]
++        for folder in settings.folders where folder.entry.isEnabled {
++            result[folder.id] = folder.entry
++        }
++        return result
++    }
++    |> distinctUntilChanged
++    |> mapToSignal { entries -> Signal<Set<Int32>, NoError> in
++        if entries.isEmpty {
++            return .single(Set())
++        }
++        // The active folders now, then again at each window boundary, and when the app comes back or the
++        // clock or the time zone changes: the timer counts uptime, which stops while the device sleeps.
++        return Signal { subscriber in
++            let queue = Queue.mainQueue()
++            let timer = Atomic<SwiftSignalKit.Timer?>(value: nil)
++            let isDisposed = Atomic<Bool>(value: false)
++            func update() {
++                if isDisposed.with({ $0 }) {
++                    return
++                }
++                let now = Date()
++                let calendar = Calendar.current
++                var active = Set<Int32>()
++                var nextCheck: Date?
++                for (id, entry) in entries {
++                    if entry.isActive(at: now, calendar: calendar) {
++                        active.insert(id)
++                    }
++                    if let transition = entry.nextTransition(after: now, calendar: calendar) {
++                        nextCheck = min(nextCheck ?? transition, transition)
++                    }
++                }
++                subscriber.putNext(active)
++                var newTimer: SwiftSignalKit.Timer?
++                if let nextCheck {
++                    newTimer = SwiftSignalKit.Timer(timeout: max(1.0, nextCheck.timeIntervalSinceNow + 1.0), repeat: false, completion: {
++                        update()
++                    }, queue: queue)
++                }
++                timer.swap(newTimer)?.invalidate()
++                newTimer?.start()
++            }
++            queue.async {
++                update()
++            }
++            let observers = [UIApplication.willEnterForegroundNotification, UIApplication.significantTimeChangeNotification, NSNotification.Name.NSSystemTimeZoneDidChange].map { name in
++                return NotificationCenter.default.addObserver(forName: name, object: nil, queue: nil, using: { _ in
++                    queue.async {
++                        update()
++                    }
++                })
++            }
++            return ActionDisposable {
++                // On the queue `update` runs on, so it cannot store a new timer after this.
++                queue.async {
++                    let _ = isDisposed.swap(true)
++                    timer.swap(nil)?.invalidate()
++                    for observer in observers {
++                        NotificationCenter.default.removeObserver(observer)
++                    }
++                }
++            }
++        }
++        |> distinctUntilChanged
++    }
++}
+diff --git a/submodules/ChatListUI/Sources/Node/ChatListItem.swift b/submodules/ChatListUI/Sources/Node/ChatListItem.swift
+index e41738b1..de2f58ba 100644
+--- a/submodules/ChatListUI/Sources/Node/ChatListItem.swift
++++ b/submodules/ChatListUI/Sources/Node/ChatListItem.swift
+@@ -143,6 +143,8 @@ public enum ChatListItemContent {
+         public var threadInfo: ThreadInfo?
+         public var combinedReadState: EnginePeerReadCounters?
+         public var isRemovedFromTotalUnreadCount: Bool
++        // Silent in folder quiet hours now: grey badges as if muted, without the mute icon.
++        public var isQuiet: Bool
+         public var presence: EnginePeer.Presence?
+         public var hasUnseenMentions: Bool
+         public var hasUnseenReactions: Bool
+@@ -170,6 +172,7 @@ public enum ChatListItemContent {
+             threadInfo: ThreadInfo?,
+             combinedReadState: EnginePeerReadCounters?,
+             isRemovedFromTotalUnreadCount: Bool,
++            isQuiet: Bool = false,
+             presence: EnginePeer.Presence?,
+             hasUnseenMentions: Bool,
+             hasUnseenReactions: Bool,
+@@ -196,6 +199,7 @@ public enum ChatListItemContent {
+             self.threadInfo = threadInfo
+             self.combinedReadState = combinedReadState
+             self.isRemovedFromTotalUnreadCount = isRemovedFromTotalUnreadCount
++            self.isQuiet = isQuiet
+             self.presence =  presence
+             self.hasUnseenMentions = hasUnseenMentions
+             self.hasUnseenReactions =  hasUnseenReactions
+@@ -2319,6 +2323,7 @@ public class ChatListItemNode: ItemListRevealOptionsItemNode {
+             var topForumTopicItems: [EngineChatList.ForumTopicData] = []
+             var autoremoveTimeout: Int32?
+             var itemTags: [ChatListItemContent.Tag] = []
++            var isQuiet = false
+             var isCommunity = false
+             var displayCommunityAvatarBadge = false
+             
+@@ -2366,6 +2371,7 @@ public class ChatListItemNode: ItemListRevealOptionsItemNode {
+                     let topForumTopicItemsValue = peerData.topForumTopicItems
+                     
+                     itemTags = peerData.tags
++                    isQuiet = peerData.isQuiet
+                 
+                     autoremoveTimeout = peerData.autoremoveTimeout
+                 
+@@ -2373,7 +2379,7 @@ public class ChatListItemNode: ItemListRevealOptionsItemNode {
+                     contentPeer = .chat(peerValue)
+                     combinedReadState = combinedReadStateValue
+                     if let combinedReadState = combinedReadState, promoInfoValue == nil && !ignoreUnreadBadge {
+-                        unreadCount = (combinedReadState.count, combinedReadState.isUnread, isRemovedFromTotalUnreadCountValue || combinedReadState.isMuted, nil, !combinedReadState.hasEverRead)
++                        unreadCount = (combinedReadState.count, combinedReadState.isUnread, isRemovedFromTotalUnreadCountValue || combinedReadState.isMuted || isQuiet, nil, !combinedReadState.hasEverRead)
+                     } else {
+                         unreadCount = (0, false, false, nil, false)
+                     }
+@@ -3453,7 +3459,7 @@ public class ChatListItemNode: ItemListRevealOptionsItemNode {
+                     })
+                 } ?? false
+                 if hasUnreadIncomingGramTransfer {
+-                    currentMentionBadgeImage = PresentationResourcesChatList.badgeBackgroundGram(item.presentationData.theme, diameter: badgeDiameter, inactive: isRemovedFromTotalUnreadCount)
++                    currentMentionBadgeImage = PresentationResourcesChatList.badgeBackgroundGram(item.presentationData.theme, diameter: badgeDiameter, inactive: isRemovedFromTotalUnreadCount || isQuiet)
+                     mentionBadgeContent = .mention
+                     if unreadCount.count == 1 {
+                         badgeContent = .none
+@@ -3463,19 +3469,22 @@ public class ChatListItemNode: ItemListRevealOptionsItemNode {
+                 } else if hasUnseenMentions {
+                     if case .chatList(.archive) = item.chatListLocation {
+                         currentMentionBadgeImage = PresentationResourcesChatList.badgeBackgroundInactiveMention(item.presentationData.theme, diameter: badgeDiameter)
++                    } else if isQuiet {
++                        // Unlike a mute, quiet hours silence mentions too.
++                        currentMentionBadgeImage = PresentationResourcesChatList.badgeBackgroundInactiveMention(item.presentationData.theme, diameter: badgeDiameter)
+                     } else {
+                         currentMentionBadgeImage = PresentationResourcesChatList.badgeBackgroundMention(item.presentationData.theme, diameter: badgeDiameter)
+                     }
+                     mentionBadgeContent = .mention
+                 } else if hasUnseenReactions {
+-                    if isRemovedFromTotalUnreadCount {
++                    if isRemovedFromTotalUnreadCount || isQuiet {
+                         currentMentionBadgeImage = PresentationResourcesChatList.badgeBackgroundInactiveReactions(item.presentationData.theme, diameter: badgeDiameter)
+                     } else {
+                         currentMentionBadgeImage = PresentationResourcesChatList.badgeBackgroundReactions(item.presentationData.theme, diameter: badgeDiameter)
+                     }
+                     mentionBadgeContent = .mention
+                 } else if hasUnseenPollVotes {
+-                    if isRemovedFromTotalUnreadCount {
++                    if isRemovedFromTotalUnreadCount || isQuiet {
+                         currentMentionBadgeImage = PresentationResourcesChatList.badgeBackgroundInactivePollVotes(item.presentationData.theme, diameter: badgeDiameter)
+                     } else {
+                         currentMentionBadgeImage = PresentationResourcesChatList.badgeBackgroundPollVotes(item.presentationData.theme, diameter: badgeDiameter)
+diff --git a/submodules/ChatListUI/Sources/Node/ChatListNode.swift b/submodules/ChatListUI/Sources/Node/ChatListNode.swift
+index 05e86107..d44cbc27 100644
+--- a/submodules/ChatListUI/Sources/Node/ChatListNode.swift
++++ b/submodules/ChatListUI/Sources/Node/ChatListNode.swift
+@@ -389,7 +389,7 @@ public struct ChatListNodeState: Equatable {
+     }
+ }
+ 
+-private func mappedInsertEntries(context: AccountContext, nodeInteraction: ChatListNodeInteraction, location: ChatListControllerLocation, isPremium: Bool, filterData: ChatListItemFilterData?, chatListFilters: [ChatListFilter]?, mode: ChatListNodeMode, isPeerEnabled: ((EnginePeer) -> Bool)?, entries: [ChatListNodeViewTransitionInsertEntry], presentationData: ChatListPresentationData) -> [ListViewInsertItem] {
++private func mappedInsertEntries(context: AccountContext, nodeInteraction: ChatListNodeInteraction, location: ChatListControllerLocation, isPremium: Bool, filterData: ChatListItemFilterData?, chatListFilters: [ChatListFilter]?, quietInclusion: ChatListFiltersInclusion, mode: ChatListNodeMode, isPeerEnabled: ((EnginePeer) -> Bool)?, entries: [ChatListNodeViewTransitionInsertEntry], presentationData: ChatListPresentationData) -> [ListViewInsertItem] {
+     return entries.map { entry -> ListViewInsertItem in
+         switch entry.entry {
+         case .HeaderEntry:
+@@ -475,6 +475,7 @@ private func mappedInsertEntries(context: AccountContext, nodeInteraction: ChatL
+                             threadInfo: threadInfo,
+                             combinedReadState: combinedReadState,
+                             isRemovedFromTotalUnreadCount: isRemovedFromTotalUnreadCount,
++                            isQuiet: chatListItemIsQuiet(location: location, peer: peer, isContact: isContact, quietInclusion: quietInclusion),
+                             presence: presence,
+                             hasUnseenMentions: hasUnseenMentions,
+                             hasUnseenReactions: hasUnseenReactions,
+@@ -806,7 +807,7 @@ private func mappedInsertEntries(context: AccountContext, nodeInteraction: ChatL
+     }
+ }
+ 
+-private func mappedUpdateEntries(context: AccountContext, nodeInteraction: ChatListNodeInteraction, location: ChatListControllerLocation, isPremium: Bool, filterData: ChatListItemFilterData?, chatListFilters: [ChatListFilter]?, mode: ChatListNodeMode, isPeerEnabled: ((EnginePeer) -> Bool)?, entries: [ChatListNodeViewTransitionUpdateEntry], presentationData: ChatListPresentationData) -> [ListViewUpdateItem] {
++private func mappedUpdateEntries(context: AccountContext, nodeInteraction: ChatListNodeInteraction, location: ChatListControllerLocation, isPremium: Bool, filterData: ChatListItemFilterData?, chatListFilters: [ChatListFilter]?, quietInclusion: ChatListFiltersInclusion, mode: ChatListNodeMode, isPeerEnabled: ((EnginePeer) -> Bool)?, entries: [ChatListNodeViewTransitionUpdateEntry], presentationData: ChatListPresentationData) -> [ListViewUpdateItem] {
+     return entries.map { entry -> ListViewUpdateItem in
+         switch entry.entry {
+             case let .PeerEntry(peerEntry):
+@@ -847,6 +848,7 @@ private func mappedUpdateEntries(context: AccountContext, nodeInteraction: ChatL
+                                 threadInfo: threadInfo,
+                                 combinedReadState: combinedReadState,
+                                 isRemovedFromTotalUnreadCount: isRemovedFromTotalUnreadCount,
++                                isQuiet: chatListItemIsQuiet(location: location, peer: peer, isContact: isContact, quietInclusion: quietInclusion),
+                                 presence: presence,
+                                 hasUnseenMentions: hasUnseenMentions,
+                                 hasUnseenReactions: hasUnseenReactions,
+@@ -1180,12 +1182,14 @@ private func mappedChatListNodeViewListTransition(
+     isPremium: Bool,
+     filterData: ChatListItemFilterData?,
+     chatListFilters: [ChatListFilter]?,
++    quietFilters: [ChatListFilter],
+     mode: ChatListNodeMode,
+     isPeerEnabled: ((EnginePeer) -> Bool)?,
+     presentationData: ChatListPresentationData,
+     transition: ChatListNodeViewTransition
+ ) -> ChatListNodeListViewTransition {
+-    return ChatListNodeListViewTransition(chatListView: transition.chatListView, deleteItems: transition.deleteItems, insertItems: mappedInsertEntries(context: context, nodeInteraction: nodeInteraction, location: location, isPremium: isPremium, filterData: filterData, chatListFilters: chatListFilters, mode: mode, isPeerEnabled: isPeerEnabled, entries: transition.insertEntries, presentationData: presentationData), updateItems: mappedUpdateEntries(context: context, nodeInteraction: nodeInteraction, location: location, isPremium: isPremium, filterData: filterData, chatListFilters: chatListFilters, mode: mode, isPeerEnabled: isPeerEnabled, entries: transition.updateEntries, presentationData: presentationData), options: transition.options, scrollToItem: transition.scrollToItem, stationaryItemRange: transition.stationaryItemRange, adjustScrollToFirstItem: transition.adjustScrollToFirstItem, animateCrossfade: transition.animateCrossfade)
++    let quietInclusion = ChatListFiltersInclusion(filters: quietFilters, accountPeerId: context.account.peerId)
++    return ChatListNodeListViewTransition(chatListView: transition.chatListView, deleteItems: transition.deleteItems, insertItems: mappedInsertEntries(context: context, nodeInteraction: nodeInteraction, location: location, isPremium: isPremium, filterData: filterData, chatListFilters: chatListFilters, quietInclusion: quietInclusion, mode: mode, isPeerEnabled: isPeerEnabled, entries: transition.insertEntries, presentationData: presentationData), updateItems: mappedUpdateEntries(context: context, nodeInteraction: nodeInteraction, location: location, isPremium: isPremium, filterData: filterData, chatListFilters: chatListFilters, quietInclusion: quietInclusion, mode: mode, isPeerEnabled: isPeerEnabled, entries: transition.updateEntries, presentationData: presentationData), options: transition.options, scrollToItem: transition.scrollToItem, stationaryItemRange: transition.stationaryItemRange, adjustScrollToFirstItem: transition.adjustScrollToFirstItem, animateCrossfade: transition.animateCrossfade)
+ }
+ 
+ private final class ChatListOpaqueTransactionState {
+@@ -2184,6 +2188,22 @@ public final class ChatListNode: ListViewImpl {
+         }
+         let previousChatListFilters = Atomic<[ChatListFilter]?>(value: nil)
+         
++        let quietFilters: Signal<[ChatListFilter], NoError>
++        switch (mode, location) {
++        case (.chatList, .chatList), (.chatList, .forum):
++            quietFilters = combineLatest(queue: .mainQueue(),
++                context.engine.peers.updatedChatListFilters(),
++                folderNotificationScheduleActiveFolderIds(engine: context.engine)
++            )
++            |> map { filters, activeFolderIds -> [ChatListFilter] in
++                return filters.filter { activeFolderIds.contains($0.id) }
++            }
++            |> distinctUntilChanged
++        default:
++            quietFilters = .single([])
++        }
++        let previousQuietFilters = Atomic<[ChatListFilter]>(value: [])
++        
+         let previousAccountIsPremium = Atomic<Bool?>(value: nil)
+         
+         let accountIsPremium = context.engine.data.subscribe(
+@@ -2203,9 +2223,10 @@ public final class ChatListNode: ListViewImpl {
+             self.statePromise.get(),
+             contacts,
+             chatListFilters,
++            quietFilters,
+             accountIsPremium
+         )
+-        |> mapToQueue { (hideArchivedFolderByDefault, displayArchiveIntro, storageInfo, savedMessagesPeer, updateAndFilter, state, contacts, chatListFilters, accountIsPremium) -> Signal<ChatListNodeListViewTransition, NoError> in
++        |> mapToQueue { (hideArchivedFolderByDefault, displayArchiveIntro, storageInfo, savedMessagesPeer, updateAndFilter, state, contacts, chatListFilters, quietFilters, accountIsPremium) -> Signal<ChatListNodeListViewTransition, NoError> in
+             let (update, filter) = updateAndFilter
+             
+             let previousHideArchivedFolderByDefaultValue = previousHideArchivedFolderByDefault.swap(hideArchivedFolderByDefault)
+@@ -2673,13 +2694,16 @@ public final class ChatListNode: ListViewImpl {
+             if chatListFilters != previousChatListFiltersValue {
+                 forceAllUpdated = true
+             }
++            if quietFilters != previousQuietFilters.swap(quietFilters) {
++                forceAllUpdated = true
++            }
+             if accountIsPremium != previousAccountIsPremium.swap(accountIsPremium) {
+                 forceAllUpdated = true
+             }
+             let presentationData = state.presentationData
+             
+             return preparedChatListNodeViewTransition(from: previousView, to: processedView, reason: reason, previewing: previewing, disableAnimations: disableAnimations, scrollPosition: updatedScrollPosition, searchMode: searchMode, forceAllUpdated: forceAllUpdated)
+-            |> map({ mappedChatListNodeViewListTransition(context: context, nodeInteraction: nodeInteraction, location: location, isPremium: accountIsPremium, filterData: filterData, chatListFilters: chatListFilters, mode: mode, isPeerEnabled: isPeerEnabled, presentationData: presentationData, transition: $0) })
++            |> map({ mappedChatListNodeViewListTransition(context: context, nodeInteraction: nodeInteraction, location: location, isPremium: accountIsPremium, filterData: filterData, chatListFilters: chatListFilters, quietFilters: quietFilters, mode: mode, isPeerEnabled: isPeerEnabled, presentationData: presentationData, transition: $0) })
+             |> runOn(prepareOnMainQueue ? Queue.mainQueue() : viewProcessingQueue)
+         }
+         
+@@ -4316,6 +4340,22 @@ func hideChatListContacts(context: AccountContext) {
+     let _ = ApplicationSpecificNotice.setDisplayChatListContacts(accountManager: context.sharedContext.accountManager).startStandalone()
+ }
+ 
++// Folder quiet hours, by the rules the notifications use. A row does not know whether its chat is archived, so it is
++// checked as the list it is shown in, like the folder tags; a forum's topics as their forum.
++private func chatListItemIsQuiet(location: ChatListControllerLocation, peer: EngineRenderedPeer, isContact: Bool, quietInclusion: ChatListFiltersInclusion) -> Bool {
++    guard !quietInclusion.isEmpty, let chatPeer = peer.peer else {
++        return false
++    }
++    switch location {
++    case let .chatList(groupId):
++        return quietInclusion.includes(peer: chatPeer, groupId: groupId, isContact: isContact)
++    case .forum:
++        return quietInclusion.includes(peer: chatPeer, groupId: .root, isContact: isContact)
++    case .savedMessagesChats:
++        return false
++    }
++}
++
+ func chatListItemTags(location: ChatListControllerLocation, accountPeerId: EnginePeer.Id, isPremium: Bool, peer: EnginePeer?, isUnread: Bool, isMuted: Bool, isContact: Bool, hasUnseenMentions: Bool, chatListFilters: [ChatListFilter]?) -> [ChatListItemContent.Tag] {
+     if !isPremium {
+         return []
+diff --git a/submodules/ChatListUI/Sources/Node/ChatListNodeLocation.swift b/submodules/ChatListUI/Sources/Node/ChatListNodeLocation.swift
+index 5ab0a1d3..6b1b44d5 100644
+--- a/submodules/ChatListUI/Sources/Node/ChatListNodeLocation.swift
++++ b/submodules/ChatListUI/Sources/Node/ChatListNodeLocation.swift
+@@ -109,92 +109,6 @@ private func chatListNodeViewUpdateWithCommunitySummaries(account: Account, upda
+     }
+ }
+ 
+-public func chatListFilterPredicate(filter: ChatListFilterData, accountPeerId: EnginePeer.Id) -> ChatListFilterPredicate {
+-    var includePeers = Set(filter.includePeers.peers)
+-    var excludePeers = Set(filter.excludePeers)
+-    
+-    if !filter.includePeers.pinnedPeers.isEmpty {
+-        includePeers.subtract(filter.includePeers.pinnedPeers)
+-        excludePeers.subtract(filter.includePeers.pinnedPeers)
+-    }
+-    
+-    var includeAdditionalPeerGroupIds: [PeerGroupId] = []
+-    if !filter.excludeArchived {
+-        includeAdditionalPeerGroupIds.append(Namespaces.PeerGroup.archive)
+-    }
+-    
+-    var messageTagSummary: ChatListMessageTagSummaryResultCalculation?
+-    if filter.excludeRead || filter.excludeMuted {
+-        messageTagSummary = ChatListMessageTagSummaryResultCalculation(addCount: ChatListMessageTagSummaryResultComponent(tag: .unseenPersonalMessage, namespace: Namespaces.Message.Cloud), subtractCount: ChatListMessageTagActionsSummaryResultComponent(type: PendingMessageActionType.consumeUnseenPersonalMessage, namespace: Namespaces.Message.Cloud))
+-    }
+-    return ChatListFilterPredicate(includePeerIds: includePeers, excludePeerIds: excludePeers, pinnedPeerIds: filter.includePeers.pinnedPeers, messageTagSummary: messageTagSummary, includeAdditionalPeerGroupIds: includeAdditionalPeerGroupIds, include: { peer, isMuted, isUnread, isContact, messageTagSummaryResult in
+-        if filter.excludeRead {
+-            var effectiveUnread = isUnread
+-            if let messageTagSummaryResult = messageTagSummaryResult, messageTagSummaryResult {
+-                effectiveUnread = true
+-            }
+-            if !effectiveUnread {
+-                return false
+-            }
+-        }
+-        if filter.excludeMuted {
+-            if isMuted {
+-                if let messageTagSummaryResult = messageTagSummaryResult, messageTagSummaryResult {
+-                } else {
+-                    return false
+-                }
+-            }
+-        }
+-        if !filter.categories.contains(.contacts) && isContact {
+-            if let user = peer as? TelegramUser {
+-                if user.botInfo == nil && !user.flags.contains(.isSupport) {
+-                    return false
+-                }
+-            } else if let _ = peer as? TelegramSecretChat {
+-                return false
+-            }
+-        }
+-        if !filter.categories.contains(.nonContacts) && (!isContact && peer.id != accountPeerId) {
+-            if let user = peer as? TelegramUser {
+-                if user.botInfo == nil {
+-                    return false
+-                }
+-            } else if let _ = peer as? TelegramSecretChat {
+-                return false
+-            }
+-        }
+-        if filter.categories.contains(.nonContacts) && peer.id == accountPeerId {
+-            return false
+-        }
+-        if !filter.categories.contains(.bots) {
+-            if let user = peer as? TelegramUser {
+-                if user.botInfo != nil || user.flags.contains(.isSupport) {
+-                    return false
+-                }
+-            }
+-        }
+-        if !filter.categories.contains(.groups) {
+-            if let _ = peer as? TelegramGroup {
+-                return false
+-            } else if let channel = peer as? TelegramChannel {
+-                if case .group = channel.info {
+-                    return false
+-                }
+-            } else if let _ = peer as? TelegramCommunity {
+-                return false
+-            }
+-        }
+-        if !filter.categories.contains(.channels) {
+-            if let channel = peer as? TelegramChannel {
+-                if case .broadcast = channel.info {
+-                    return false
+-                }
+-            }
+-        }
+-        return true
+-    })
+-}
+-
+ public func chatListViewForLocation(chatListLocation: ChatListControllerLocation, location: ChatListNodeLocation, account: Account, shouldLoadCanMessagePeer: Bool) -> Signal<ChatListNodeViewUpdate, NoError> {
+     let accountPeerId = account.peerId
+     
+diff --git a/submodules/FolderNotificationSchedule/BUILD b/submodules/FolderNotificationSchedule/BUILD
+new file mode 100644
+index 00000000..8a772ddc
+--- /dev/null
++++ b/submodules/FolderNotificationSchedule/BUILD
+@@ -0,0 +1,32 @@
++load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library", "swift_test")
++
++swift_library(
++    name = "FolderNotificationSchedule",
++    module_name = "FolderNotificationSchedule",
++    srcs = glob([
++        "Sources/**/*.swift",
++    ]),
++    copts = [
++        "-warnings-as-errors",
++    ],
++    deps = [
++    ],
++    visibility = [
++        "//visibility:public",
++    ],
++)
++
++# Host (macOS) test: the module needs nothing but Foundation.
++# Run with `./build-input/bazel-9.2.0-darwin-arm64 test //submodules/FolderNotificationSchedule:FolderNotificationScheduleTests`.
++swift_test(
++    name = "FolderNotificationScheduleTests",
++    srcs = glob([
++        "Tests/**/*.swift",
++    ]),
++    copts = [
++        "-warnings-as-errors",
++    ],
++    deps = [
++        ":FolderNotificationSchedule",
++    ],
++)
+diff --git a/submodules/FolderNotificationSchedule/Sources/FolderNotificationSchedule.swift b/submodules/FolderNotificationSchedule/Sources/FolderNotificationSchedule.swift
+new file mode 100644
+index 00000000..fe86890a
+--- /dev/null
++++ b/submodules/FolderNotificationSchedule/Sources/FolderNotificationSchedule.swift
+@@ -0,0 +1,210 @@
++import Foundation
++
++// A weekly time window, in the device's local wall-clock time, attached to a chat folder.
++//
++// `startMinute` and `endMinute` are minutes after local midnight (0..<1440). A window starts on each of
++// `days` and ends at `endMinute`: on the same day when `endMinute > startMinute`, on the next day when
++// `endMinute < startMinute` (a night window such as 22:00–07:00 started on Friday ends on Saturday), and
++// exactly 24 hours later when the two are equal (00:00–00:00 is the whole day).
++//
++// Wall-clock time means 19:00 stays 19:00 after the user travels or the clocks change, the way alarms and
++// Focus schedules behave; the calendar passed in decides the time zone.
++public struct FolderNotificationSchedule: Codable, Equatable {
++    public struct Days: OptionSet, Hashable {
++        public var rawValue: Int32
++
++        public init(rawValue: Int32) {
++            self.rawValue = rawValue
++        }
++
++        public static let monday = Days(rawValue: 1 << 0)
++        public static let tuesday = Days(rawValue: 1 << 1)
++        public static let wednesday = Days(rawValue: 1 << 2)
++        public static let thursday = Days(rawValue: 1 << 3)
++        public static let friday = Days(rawValue: 1 << 4)
++        public static let saturday = Days(rawValue: 1 << 5)
++        public static let sunday = Days(rawValue: 1 << 6)
++
++        public static let weekdays: Days = [.monday, .tuesday, .wednesday, .thursday, .friday]
++        public static let weekends: Days = [.saturday, .sunday]
++        public static let everyDay: Days = [.weekdays, .weekends]
++
++        // Monday-first index, 0...6.
++        public init(dayIndex: Int) {
++            self.init(rawValue: 1 << Int32(dayIndex))
++        }
++
++        public func contains(dayIndex: Int) -> Bool {
++            return self.contains(Days(dayIndex: dayIndex))
++        }
++    }
++
++    public static let minutesPerDay: Int32 = 24 * 60
++
++    public var days: Days
++    public var startMinute: Int32
++    public var endMinute: Int32
++
++    public init(days: Days, startMinute: Int32, endMinute: Int32) {
++        self.days = days
++        self.startMinute = FolderNotificationSchedule.clampMinute(startMinute)
++        self.endMinute = FolderNotificationSchedule.clampMinute(endMinute)
++    }
++
++    public init(from decoder: Decoder) throws {
++        let container = try decoder.container(keyedBy: CodingKeys.self)
++        self.days = Days(rawValue: try container.decode(Int32.self, forKey: .days) & Days.everyDay.rawValue)
++        self.startMinute = FolderNotificationSchedule.clampMinute(try container.decode(Int32.self, forKey: .startMinute))
++        self.endMinute = FolderNotificationSchedule.clampMinute(try container.decode(Int32.self, forKey: .endMinute))
++    }
++
++    public func encode(to encoder: Encoder) throws {
++        var container = encoder.container(keyedBy: CodingKeys.self)
++        try container.encode(self.days.rawValue, forKey: .days)
++        try container.encode(self.startMinute, forKey: .startMinute)
++        try container.encode(self.endMinute, forKey: .endMinute)
++    }
++
++    private enum CodingKeys: String, CodingKey {
++        case days = "d"
++        case startMinute = "s"
++        case endMinute = "e"
++    }
++
++    private static func clampMinute(_ value: Int32) -> Int32 {
++        return max(0, min(FolderNotificationSchedule.minutesPerDay - 1, value))
++    }
++
++    public var isWholeDay: Bool {
++        return self.startMinute == self.endMinute
++    }
++
++    public var endsNextDay: Bool {
++        return self.endMinute <= self.startMinute
++    }
++
++    // Monday-first day index (0...6) and minute of the day (0..<1440) of `date` in `calendar`'s time zone.
++    public static func position(of date: Date, calendar: Calendar) -> (dayIndex: Int, minute: Int32) {
++        let components = calendar.dateComponents([.weekday, .hour, .minute], from: date)
++        // Calendar weekdays are 1 (Sunday) ... 7 (Saturday) in every calendar Foundation ships.
++        let weekday = components.weekday ?? 2
++        let dayIndex = (weekday + 5) % 7
++        let minute = Int32((components.hour ?? 0) * 60 + (components.minute ?? 0))
++        return (dayIndex, minute)
++    }
++
++    // Whether `date` falls inside a window.
++    public func contains(_ date: Date, calendar: Calendar) -> Bool {
++        let (dayIndex, minute) = FolderNotificationSchedule.position(of: date, calendar: calendar)
++        return self.contains(dayIndex: dayIndex, minute: minute)
++    }
++
++    public func contains(dayIndex: Int, minute: Int32) -> Bool {
++        // A window started today.
++        if self.days.contains(dayIndex: dayIndex) {
++            if self.endMinute > self.startMinute {
++                if minute >= self.startMinute && minute < self.endMinute {
++                    return true
++                }
++            } else if minute >= self.startMinute {
++                return true
++            }
++        }
++        // A window started yesterday that runs past midnight.
++        let previousDayIndex = (dayIndex + 6) % 7
++        if self.days.contains(dayIndex: previousDayIndex) && self.endsNextDay && minute < self.endMinute {
++            return true
++        }
++        return false
++    }
++
++    // The first moment after `date` at which `contains` gives a different answer, or nil if it never
++    // changes (no days, or windows that cover the whole week).
++    //
++    // The answer can only change where the local clock reads `startMinute` or `endMinute`, or where the
++    // clocks themselves change, so only those moments are tried, over the next eight days: both readings
++    // of a time the clocks go back over, the first moment after a gap they jump forward over (the
++    // calendar's `.nextTime` policy), and each daylight saving transition itself.
++    public func nextTransition(after date: Date, calendar: Calendar) -> Date? {
++        return FolderNotificationSchedule.nextTransition(of: [self], after: date, calendar: calendar)
++    }
++
++    // The first moment after `date` at which a date's membership in the union of `schedules` changes.
++    public static func nextTransition(of schedules: [FolderNotificationSchedule], after date: Date, calendar: Calendar) -> Date? {
++        let schedules = schedules.filter { !$0.days.isEmpty }
++        if schedules.isEmpty {
++            return nil
++        }
++        if schedules.contains(where: { $0.days == .everyDay && $0.isWholeDay }) {
++            return nil
++        }
++        let isInside: (Date) -> Bool = { date in
++            return schedules.contains(where: { $0.contains(date, calendar: calendar) })
++        }
++        let current = isInside(date)
++        var boundaryMinutes = Set<Int32>()
++        for schedule in schedules {
++            boundaryMinutes.insert(schedule.startMinute)
++            boundaryMinutes.insert(schedule.endMinute)
++        }
++        let startOfDay = calendar.startOfDay(for: date)
++        var candidates: [Date] = []
++        for dayOffset in 0 ... 8 {
++            guard let day = calendar.date(byAdding: .day, value: dayOffset, to: startOfDay) else {
++                continue
++            }
++            for minute in boundaryMinutes {
++                for repeatedTimePolicy in [Calendar.RepeatedTimePolicy.first, .last] {
++                    if let candidate = calendar.date(bySettingHour: Int(minute / 60), minute: Int(minute % 60), second: 0, of: day, matchingPolicy: .nextTime, repeatedTimePolicy: repeatedTimePolicy, direction: .forward), candidate > date {
++                        candidates.append(candidate)
++                    }
++                }
++            }
++        }
++        let searchEnd = date.addingTimeInterval(9.0 * 24.0 * 60.0 * 60.0)
++        var clockChange = date
++        while let next = calendar.timeZone.nextDaylightSavingTimeTransition(after: clockChange), next < searchEnd {
++            candidates.append(next)
++            clockChange = next
++        }
++        candidates.sort()
++        for candidate in candidates {
++            if isInside(candidate) != current {
++                return candidate
++            }
++        }
++        return nil
++    }
++}
++
++// A folder's quiet hours: one or more weekly windows, and whether they are in force.
++public struct FolderNotificationScheduleEntry: Codable, Equatable {
++    public var isEnabled: Bool
++    public var schedules: [FolderNotificationSchedule]
++
++    public init(isEnabled: Bool, schedules: [FolderNotificationSchedule]) {
++        self.isEnabled = isEnabled
++        self.schedules = schedules
++    }
++
++    private enum CodingKeys: String, CodingKey {
++        case isEnabled = "en"
++        case schedules = "sc"
++    }
++
++    // Whether the folder is in quiet hours at `date`.
++    public func isActive(at date: Date, calendar: Calendar) -> Bool {
++        if !self.isEnabled {
++            return false
++        }
++        return self.schedules.contains(where: { $0.contains(date, calendar: calendar) })
++    }
++
++    // When `isActive` next changes, or nil if it never does.
++    public func nextTransition(after date: Date, calendar: Calendar) -> Date? {
++        if !self.isEnabled {
++            return nil
++        }
++        return FolderNotificationSchedule.nextTransition(of: self.schedules, after: date, calendar: calendar)
++    }
++}
+diff --git a/submodules/FolderNotificationSchedule/Tests/FolderNotificationScheduleTests.swift b/submodules/FolderNotificationSchedule/Tests/FolderNotificationScheduleTests.swift
+new file mode 100644
+index 00000000..e38f0d29
+--- /dev/null
++++ b/submodules/FolderNotificationSchedule/Tests/FolderNotificationScheduleTests.swift
+@@ -0,0 +1,320 @@
++import Foundation
++import XCTest
++import FolderNotificationSchedule
++
++final class FolderNotificationScheduleTests: XCTestCase {
++    private func calendar(_ timeZoneId: String) -> Calendar {
++        var calendar = Calendar(identifier: .gregorian)
++        calendar.timeZone = TimeZone(identifier: timeZoneId)!
++        return calendar
++    }
++
++    // A wall-clock moment in `calendar`'s time zone.
++    private func date(_ calendar: Calendar, _ year: Int, _ month: Int, _ day: Int, _ hour: Int, _ minute: Int) -> Date {
++        var components = DateComponents()
++        components.year = year
++        components.month = month
++        components.day = day
++        components.hour = hour
++        components.minute = minute
++        return calendar.date(from: components)!
++    }
++
++    private func minutes(_ hour: Int32, _ minute: Int32) -> Int32 {
++        return hour * 60 + minute
++    }
++
++    // 2026-10-26 is a Monday.
++    private let mondayDay = 26
++
++    func testSameDayWindow() {
++        let calendar = self.calendar("Europe/Berlin")
++        let schedule = FolderNotificationSchedule(days: .weekdays, startMinute: self.minutes(9, 0), endMinute: self.minutes(18, 0))
++        XCTAssertFalse(schedule.contains(self.date(calendar, 2026, 10, self.mondayDay, 8, 59), calendar: calendar))
++        XCTAssertTrue(schedule.contains(self.date(calendar, 2026, 10, self.mondayDay, 9, 0), calendar: calendar))
++        XCTAssertTrue(schedule.contains(self.date(calendar, 2026, 10, self.mondayDay, 17, 59), calendar: calendar))
++        XCTAssertFalse(schedule.contains(self.date(calendar, 2026, 10, self.mondayDay, 18, 0), calendar: calendar))
++        // Saturday is not in the set.
++        XCTAssertFalse(schedule.contains(self.date(calendar, 2026, 10, self.mondayDay + 5, 10, 0), calendar: calendar))
++    }
++
++    func testNightWindowEveryDay() {
++        let calendar = self.calendar("Europe/Berlin")
++        let schedule = FolderNotificationSchedule(days: .everyDay, startMinute: self.minutes(22, 0), endMinute: self.minutes(7, 0))
++        XCTAssertFalse(schedule.contains(self.date(calendar, 2026, 10, self.mondayDay, 21, 59), calendar: calendar))
++        XCTAssertTrue(schedule.contains(self.date(calendar, 2026, 10, self.mondayDay, 22, 0), calendar: calendar))
++        XCTAssertTrue(schedule.contains(self.date(calendar, 2026, 10, self.mondayDay + 1, 2, 0), calendar: calendar))
++        XCTAssertTrue(schedule.contains(self.date(calendar, 2026, 10, self.mondayDay + 1, 6, 59), calendar: calendar))
++        XCTAssertFalse(schedule.contains(self.date(calendar, 2026, 10, self.mondayDay + 1, 7, 0), calendar: calendar))
++    }
++
++    // A night window belongs to the day it starts on.
++    func testNightWindowBelongsToItsStartDay() {
++        let calendar = self.calendar("Europe/Berlin")
++        let schedule = FolderNotificationSchedule(days: .weekdays, startMinute: self.minutes(22, 0), endMinute: self.minutes(7, 0))
++        // Friday night runs into Saturday morning.
++        XCTAssertTrue(schedule.contains(self.date(calendar, 2026, 10, self.mondayDay + 5, 6, 0), calendar: calendar))
++        // Saturday and Sunday nights are not in the set.
++        XCTAssertFalse(schedule.contains(self.date(calendar, 2026, 10, self.mondayDay + 5, 23, 0), calendar: calendar))
++        XCTAssertFalse(schedule.contains(self.date(calendar, 2026, 10, self.mondayDay + 6, 6, 0), calendar: calendar))
++        XCTAssertFalse(schedule.contains(self.date(calendar, 2026, 11, 2, 6, 0), calendar: calendar))
++        // Monday night runs into Tuesday morning.
++        XCTAssertTrue(schedule.contains(self.date(calendar, 2026, 10, self.mondayDay + 1, 6, 0), calendar: calendar))
++    }
++
++    func testWholeDay() {
++        let calendar = self.calendar("Europe/Berlin")
++        let schedule = FolderNotificationSchedule(days: .weekends, startMinute: 0, endMinute: 0)
++        XCTAssertTrue(schedule.isWholeDay)
++        XCTAssertFalse(schedule.contains(self.date(calendar, 2026, 10, self.mondayDay + 4, 23, 59), calendar: calendar))
++        XCTAssertTrue(schedule.contains(self.date(calendar, 2026, 10, self.mondayDay + 5, 0, 0), calendar: calendar))
++        XCTAssertTrue(schedule.contains(self.date(calendar, 2026, 10, self.mondayDay + 6, 23, 59), calendar: calendar))
++        XCTAssertFalse(schedule.contains(self.date(calendar, 2026, 11, 2, 0, 0), calendar: calendar))
++    }
++
++    // Equal start and end that is not midnight is a 24-hour window.
++    func testTwentyFourHoursFromStart() {
++        let calendar = self.calendar("Europe/Berlin")
++        let schedule = FolderNotificationSchedule(days: [.monday], startMinute: self.minutes(9, 0), endMinute: self.minutes(9, 0))
++        XCTAssertFalse(schedule.contains(self.date(calendar, 2026, 10, self.mondayDay, 8, 59), calendar: calendar))
++        XCTAssertTrue(schedule.contains(self.date(calendar, 2026, 10, self.mondayDay, 9, 0), calendar: calendar))
++        XCTAssertTrue(schedule.contains(self.date(calendar, 2026, 10, self.mondayDay + 1, 8, 59), calendar: calendar))
++        XCTAssertFalse(schedule.contains(self.date(calendar, 2026, 10, self.mondayDay + 1, 9, 0), calendar: calendar))
++    }
++
++    // Sunday night continues into Monday morning across the end of the week.
++    func testWeekWrap() {
++        let calendar = self.calendar("Europe/Berlin")
++        let schedule = FolderNotificationSchedule(days: [.sunday], startMinute: self.minutes(23, 0), endMinute: self.minutes(1, 0))
++        XCTAssertTrue(schedule.contains(self.date(calendar, 2026, 11, 2, 0, 30), calendar: calendar))
++        XCTAssertFalse(schedule.contains(self.date(calendar, 2026, 11, 2, 1, 0), calendar: calendar))
++        XCTAssertFalse(schedule.contains(self.date(calendar, 2026, 11, 3, 0, 30), calendar: calendar))
++    }
++
++    func testEmptyAndFullSchedulesNeverChange() {
++        let calendar = self.calendar("Europe/Berlin")
++        let now = self.date(calendar, 2026, 10, self.mondayDay, 12, 0)
++        let empty = FolderNotificationSchedule(days: [], startMinute: self.minutes(9, 0), endMinute: self.minutes(18, 0))
++        XCTAssertFalse(empty.contains(now, calendar: calendar))
++        XCTAssertNil(empty.nextTransition(after: now, calendar: calendar))
++
++        let full = FolderNotificationSchedule(days: .everyDay, startMinute: self.minutes(6, 0), endMinute: self.minutes(6, 0))
++        XCTAssertTrue(full.contains(now, calendar: calendar))
++        XCTAssertNil(full.nextTransition(after: now, calendar: calendar))
++    }
++
++    func testNextTransition() {
++        let calendar = self.calendar("Europe/Berlin")
++        let schedule = FolderNotificationSchedule(days: .weekdays, startMinute: self.minutes(9, 0), endMinute: self.minutes(18, 0))
++        XCTAssertEqual(schedule.nextTransition(after: self.date(calendar, 2026, 10, self.mondayDay, 8, 0), calendar: calendar), self.date(calendar, 2026, 10, self.mondayDay, 9, 0))
++        XCTAssertEqual(schedule.nextTransition(after: self.date(calendar, 2026, 10, self.mondayDay, 9, 0), calendar: calendar), self.date(calendar, 2026, 10, self.mondayDay, 18, 0))
++        XCTAssertEqual(schedule.nextTransition(after: self.date(calendar, 2026, 10, self.mondayDay, 10, 0), calendar: calendar), self.date(calendar, 2026, 10, self.mondayDay, 18, 0))
++        // Friday evening: the next change is Monday morning.
++        XCTAssertEqual(schedule.nextTransition(after: self.date(calendar, 2026, 10, self.mondayDay + 4, 18, 30), calendar: calendar), self.date(calendar, 2026, 11, 2, 9, 0))
++    }
++
++    // Every night plus whole weekends: one quiet stretch from Friday evening to Monday morning.
++    func testUnionOfNightAndWeekendWindows() {
++        let calendar = self.calendar("Europe/Berlin")
++        let entry = FolderNotificationScheduleEntry(isEnabled: true, schedules: [
++            FolderNotificationSchedule(days: .everyDay, startMinute: self.minutes(19, 0), endMinute: self.minutes(9, 0)),
++            FolderNotificationSchedule(days: .weekends, startMinute: 0, endMinute: 0)
++        ])
++        let mondayMorning = self.date(calendar, 2026, 11, 2, 9, 0)
++        for (day, hour) in [(30, 20), (31, 12), (1, 7)] {
++            let month = day == 1 ? 11 : 10
++            let now = self.date(calendar, 2026, month, day, hour, 0)
++            XCTAssertTrue(entry.isActive(at: now, calendar: calendar))
++            XCTAssertEqual(entry.nextTransition(after: now, calendar: calendar), mondayMorning)
++        }
++        XCTAssertFalse(entry.isActive(at: mondayMorning, calendar: calendar))
++        XCTAssertEqual(entry.nextTransition(after: mondayMorning, calendar: calendar), self.date(calendar, 2026, 11, 2, 19, 0))
++    }
++
++    // Europe/Berlin goes from 02:00 to 03:00 on 2026-03-29. A window that starts at 02:30 starts at 03:00 that night.
++    func testClocksGoForwardOverTheStart() {
++        let calendar = self.calendar("Europe/Berlin")
++        let schedule = FolderNotificationSchedule(days: .everyDay, startMinute: self.minutes(2, 30), endMinute: self.minutes(4, 0))
++        let before = self.date(calendar, 2026, 3, 29, 1, 59)
++        XCTAssertFalse(schedule.contains(before, calendar: calendar))
++        let transition = schedule.nextTransition(after: before, calendar: calendar)
++        XCTAssertEqual(transition, before.addingTimeInterval(60))
++        if let transition {
++            XCTAssertTrue(schedule.contains(transition, calendar: calendar))
++            XCTAssertEqual(calendar.component(.hour, from: transition), 3)
++        }
++    }
++
++    // Europe/Berlin goes back from 03:00 to 02:00 on 2026-10-25, so 02:00–03:00 happens twice. A window of
++    // 02:30–04:00 is left at the clock change and entered again at the second 02:30.
++    func testClocksGoBackInsideTheWindow() {
++        let calendar = self.calendar("Europe/Berlin")
++        let utc = self.calendar("UTC")
++        let schedule = FolderNotificationSchedule(days: .everyDay, startMinute: self.minutes(2, 30), endMinute: self.minutes(4, 0))
++        let summerQuarterToThree = self.date(utc, 2026, 10, 25, 0, 45)
++        XCTAssertTrue(schedule.contains(summerQuarterToThree, calendar: calendar))
++        let clockChange = self.date(utc, 2026, 10, 25, 1, 0)
++        XCTAssertEqual(schedule.nextTransition(after: summerQuarterToThree, calendar: calendar), clockChange)
++        XCTAssertEqual(schedule.nextTransition(after: clockChange, calendar: calendar), self.date(utc, 2026, 10, 25, 1, 30))
++    }
++
++    // Windows that begin or end right where the clocks change, in zones that change at midnight
++    // (Santiago), at 23:00 local time (Scoresbysund) or by half an hour (Lord Howe).
++    func testWindowsAtClockChangesMatchMinuteWalk() {
++        let utc = self.calendar("UTC")
++        for timeZoneId in ["Europe/Berlin", "America/New_York", "America/Santiago", "America/Scoresbysund", "Australia/Lord_Howe"] {
++            let calendar = self.calendar(timeZoneId)
++            var changes: [Date] = []
++            var cursor = self.date(utc, 2026, 1, 1, 0, 0)
++            while let next = calendar.timeZone.nextDaylightSavingTimeTransition(after: cursor), next < self.date(utc, 2027, 1, 1, 0, 0) {
++                changes.append(next)
++                cursor = next
++            }
++            XCTAssertEqual(changes.count, 2, timeZoneId)
++            for change in changes {
++                // The wall-clock minute the old offset reaches at the change, and the one the new offset starts from.
++                let before = FolderNotificationSchedule.position(of: change.addingTimeInterval(-60.0), calendar: calendar).minute + 1
++                let after = FolderNotificationSchedule.position(of: change, calendar: calendar)
++                let boundaries = Set([before, after.minute, before - 30, before + 30, after.minute - 30, after.minute + 30].map { ($0 + 1440) % 1440 })
++                let daySets: [FolderNotificationSchedule.Days] = [.everyDay, FolderNotificationSchedule.Days(dayIndex: after.dayIndex), FolderNotificationSchedule.Days(dayIndex: (after.dayIndex + 6) % 7)]
++                for days in daySets {
++                    for start in boundaries {
++                        for end in boundaries where end != start {
++                            let schedule = FolderNotificationSchedule(days: days, startMinute: start, endMinute: end)
++                            for now in [change.addingTimeInterval(-3.0 * 60.0 * 60.0), change.addingTimeInterval(-60.0)] {
++                                XCTAssertEqual(schedule.nextTransition(after: now, calendar: calendar), self.walkToNextTransition(schedule: schedule, after: now, calendar: calendar), "\(timeZoneId) \(schedule) \(now)")
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    // The fast transition search must agree with a minute-by-minute walk, including across clock changes.
++    func testNextTransitionMatchesMinuteWalk() {
++        var generator = SeededGenerator(seed: 0x5eed)
++        let timeZones = ["Europe/Berlin", "America/New_York", "Australia/Sydney", "Pacific/Chatham", "Asia/Kolkata", "UTC"]
++        // Around the 2026 clock changes of those zones, plus ordinary days.
++        let origins: [(Int, Int, Int)] = [(2026, 3, 7), (2026, 3, 28), (2026, 4, 4), (2026, 9, 26), (2026, 10, 3), (2026, 10, 24), (2026, 10, 31), (2026, 6, 15)]
++        var checked = 0
++        for timeZoneId in timeZones {
++            let calendar = self.calendar(timeZoneId)
++            for origin in origins {
++                for _ in 0 ..< 12 {
++                    let days = FolderNotificationSchedule.Days(rawValue: Int32(generator.next() % 128))
++                    let start = Int32(generator.next() % 1440)
++                    let end = generator.next() % 4 == 0 ? start : Int32(generator.next() % 1440)
++                    let schedule = FolderNotificationSchedule(days: days, startMinute: start, endMinute: end)
++                    let offsetMinutes = Int(generator.next() % UInt64(3 * 1440))
++                    let base = self.date(calendar, origin.0, origin.1, origin.2, 0, 0)
++                    let now = calendar.date(byAdding: .minute, value: offsetMinutes, to: base)!.addingTimeInterval(Double(generator.next() % 60))
++                    XCTAssertEqual(schedule.nextTransition(after: now, calendar: calendar), self.walkToNextTransition(schedule: schedule, after: now, calendar: calendar), "\(timeZoneId) \(schedule) \(now)")
++                    checked += 1
++                }
++            }
++        }
++        XCTAssertEqual(checked, timeZones.count * origins.count * 12)
++    }
++
++    private func walkToNextTransition(schedule: FolderNotificationSchedule, after date: Date, calendar: Calendar) -> Date? {
++        let current = schedule.contains(date, calendar: calendar)
++        var candidate = calendar.dateInterval(of: .minute, for: date)!.start
++        for _ in 0 ..< 9 * 1440 {
++            candidate = candidate.addingTimeInterval(60)
++            if schedule.contains(candidate, calendar: calendar) != current {
++                return candidate
++            }
++        }
++        return nil
++    }
++
++    // Schedules against what they mean: each selected day starts one window at `startMinute` that lasts until
++    // `endMinute` (the next day when it is not later, a whole day when equal), and a minute of the week is quiet
++    // when one of those windows covers it. Every set of days with every kind of window, and every pair of start
++    // and end at the edges of the day and of the hour with every kind of set of days, each checked at every
++    // minute of the week.
++    func testSchedulesMinuteByMinute() {
++        let minutesPerDay = Int(FolderNotificationSchedule.minutesPerDay)
++        let minutesPerWeek = 7 * minutesPerDay
++        let edges: [Int32] = [0, 1, 59, 720, 1140, 1380, 1438, 1439]
++        let windows: [(Int32, Int32)] = [(540, 1080), (1140, 540), (0, 0), (720, 720), (1080, 0), (0, 1), (1439, 0), (1, 0)]
++        let daySets: [Int32] = [0, 1 << 0, 1 << 6, 0b0011111, 0b1100000, 0b1111111, 0b1000001, 0b1010101]
++        var schedules: [FolderNotificationSchedule] = []
++        for days in Int32(0) ..< 128 {
++            for (start, end) in windows {
++                schedules.append(FolderNotificationSchedule(days: FolderNotificationSchedule.Days(rawValue: days), startMinute: start, endMinute: end))
++            }
++        }
++        for days in daySets {
++            for start in edges {
++                for end in edges {
++                    schedules.append(FolderNotificationSchedule(days: FolderNotificationSchedule.Days(rawValue: days), startMinute: start, endMinute: end))
++                }
++            }
++        }
++        for schedule in schedules {
++            let start = Int(schedule.startMinute)
++            let end = Int(schedule.endMinute)
++            let length = end > start ? end - start : minutesPerDay - start + end
++            var expected = [Bool](repeating: false, count: minutesPerWeek)
++            for dayIndex in 0 ..< 7 where schedule.days.rawValue & (1 << dayIndex) != 0 {
++                for offset in 0 ..< length {
++                    expected[(dayIndex * minutesPerDay + start + offset) % minutesPerWeek] = true
++                }
++            }
++            for minuteOfWeek in 0 ..< minutesPerWeek {
++                if schedule.contains(dayIndex: minuteOfWeek / minutesPerDay, minute: Int32(minuteOfWeek % minutesPerDay)) != expected[minuteOfWeek] {
++                    XCTFail("\(schedule) on day \(minuteOfWeek / minutesPerDay) at minute \(minuteOfWeek % minutesPerDay)")
++                    return
++                }
++            }
++        }
++        XCTAssertEqual(schedules.count, 128 * windows.count + daySets.count * edges.count * edges.count)
++    }
++
++    func testDayIndicesFollowTheWeekWhateverTheFirstWeekday() {
++        var calendar = self.calendar("Europe/Berlin")
++        calendar.firstWeekday = 1
++        let sunday = self.date(calendar, 2026, 11, 1, 12, 0)
++        XCTAssertEqual(FolderNotificationSchedule.position(of: sunday, calendar: calendar).dayIndex, 6)
++        calendar.firstWeekday = 2
++        XCTAssertEqual(FolderNotificationSchedule.position(of: sunday, calendar: calendar).dayIndex, 6)
++        XCTAssertEqual(FolderNotificationSchedule.position(of: self.date(calendar, 2026, 10, self.mondayDay, 0, 0), calendar: calendar).dayIndex, 0)
++        XCTAssertEqual((0 ..< 7).filter { FolderNotificationSchedule.Days.weekdays.contains(dayIndex: $0) }, [0, 1, 2, 3, 4])
++        XCTAssertEqual((0 ..< 7).filter { FolderNotificationSchedule.Days.weekends.contains(dayIndex: $0) }, [5, 6])
++        XCTAssertEqual(FolderNotificationSchedule.Days(dayIndex: 3), .thursday)
++    }
++
++    func testCodingRoundTripAndSanitizing() throws {
++        let entry = FolderNotificationScheduleEntry(isEnabled: true, schedules: [
++            FolderNotificationSchedule(days: [.monday, .friday], startMinute: self.minutes(19, 30), endMinute: self.minutes(8, 15)),
++            FolderNotificationSchedule(days: .weekends, startMinute: 0, endMinute: 0)
++        ])
++        let data = try JSONEncoder().encode(entry)
++        XCTAssertEqual(try JSONDecoder().decode(FolderNotificationScheduleEntry.self, from: data), entry)
++
++        // Out-of-range values from a damaged store are clamped and unknown day bits dropped.
++        let damaged = "{\"sc\":[{\"d\":1023,\"s\":5000,\"e\":-3}],\"en\":false}".data(using: .utf8)!
++        let decoded = try JSONDecoder().decode(FolderNotificationScheduleEntry.self, from: damaged)
++        XCTAssertEqual(decoded.schedules.count, 1)
++        XCTAssertEqual(decoded.schedules.first?.days, .everyDay)
++        XCTAssertEqual(decoded.schedules.first?.startMinute, 1439)
++        XCTAssertEqual(decoded.schedules.first?.endMinute, 0)
++        XCTAssertFalse(decoded.isEnabled)
++    }
++}
++
++// Deterministic generator so a failure reproduces.
++private struct SeededGenerator {
++    private var state: UInt64
++
++    init(seed: UInt64) {
++        self.state = seed
++    }
++
++    mutating func next() -> UInt64 {
++        self.state = self.state &* 6364136223846793005 &+ 1442695040888963407
++        return self.state >> 17
++    }
++}
+diff --git a/submodules/TelegramCore/Sources/TelegramEngine/Peers/ChatListFiltering.swift b/submodules/TelegramCore/Sources/TelegramEngine/Peers/ChatListFiltering.swift
+index f8aacb5a..4cfec5da 100644
+--- a/submodules/TelegramCore/Sources/TelegramEngine/Peers/ChatListFiltering.swift
++++ b/submodules/TelegramCore/Sources/TelegramEngine/Peers/ChatListFiltering.swift
+@@ -1256,6 +1256,148 @@ func _internal_currentChatListFiltersState(transaction: Transaction) -> ChatList
+     return settings
+ }
+ 
++public func chatListFilterPredicate(filter: ChatListFilterData, accountPeerId: EnginePeer.Id) -> ChatListFilterPredicate {
++    var includePeers = Set(filter.includePeers.peers)
++    var excludePeers = Set(filter.excludePeers)
++    
++    if !filter.includePeers.pinnedPeers.isEmpty {
++        includePeers.subtract(filter.includePeers.pinnedPeers)
++        excludePeers.subtract(filter.includePeers.pinnedPeers)
++    }
++    
++    var includeAdditionalPeerGroupIds: [PeerGroupId] = []
++    if !filter.excludeArchived {
++        includeAdditionalPeerGroupIds.append(Namespaces.PeerGroup.archive)
++    }
++    
++    var messageTagSummary: ChatListMessageTagSummaryResultCalculation?
++    if filter.excludeRead || filter.excludeMuted {
++        messageTagSummary = ChatListMessageTagSummaryResultCalculation(addCount: ChatListMessageTagSummaryResultComponent(tag: .unseenPersonalMessage, namespace: Namespaces.Message.Cloud), subtractCount: ChatListMessageTagActionsSummaryResultComponent(type: PendingMessageActionType.consumeUnseenPersonalMessage, namespace: Namespaces.Message.Cloud))
++    }
++    return ChatListFilterPredicate(includePeerIds: includePeers, excludePeerIds: excludePeers, pinnedPeerIds: filter.includePeers.pinnedPeers, messageTagSummary: messageTagSummary, includeAdditionalPeerGroupIds: includeAdditionalPeerGroupIds, include: { peer, isMuted, isUnread, isContact, messageTagSummaryResult in
++        if filter.excludeRead {
++            var effectiveUnread = isUnread
++            if let messageTagSummaryResult = messageTagSummaryResult, messageTagSummaryResult {
++                effectiveUnread = true
++            }
++            if !effectiveUnread {
++                return false
++            }
++        }
++        if filter.excludeMuted {
++            if isMuted {
++                if let messageTagSummaryResult = messageTagSummaryResult, messageTagSummaryResult {
++                } else {
++                    return false
++                }
++            }
++        }
++        if !filter.categories.contains(.contacts) && isContact {
++            if let user = peer as? TelegramUser {
++                if user.botInfo == nil && !user.flags.contains(.isSupport) {
++                    return false
++                }
++            } else if let _ = peer as? TelegramSecretChat {
++                return false
++            }
++        }
++        if !filter.categories.contains(.nonContacts) && (!isContact && peer.id != accountPeerId) {
++            if let user = peer as? TelegramUser {
++                if user.botInfo == nil {
++                    return false
++                }
++            } else if let _ = peer as? TelegramSecretChat {
++                return false
++            }
++        }
++        if filter.categories.contains(.nonContacts) && peer.id == accountPeerId {
++            return false
++        }
++        if !filter.categories.contains(.bots) {
++            if let user = peer as? TelegramUser {
++                if user.botInfo != nil || user.flags.contains(.isSupport) {
++                    return false
++                }
++            }
++        }
++        if !filter.categories.contains(.groups) {
++            if let _ = peer as? TelegramGroup {
++                return false
++            } else if let channel = peer as? TelegramChannel {
++                if case .group = channel.info {
++                    return false
++                }
++            } else if let _ = peer as? TelegramCommunity {
++                return false
++            }
++        }
++        if !filter.categories.contains(.channels) {
++            if let channel = peer as? TelegramChannel {
++                if case .broadcast = channel.info {
++                    return false
++                }
++            }
++        }
++        return true
++    })
++}
++
++// Whether any of the folders `filterIds` shows the chat `peerId` now, by the folder's own rules, except that being muted
++// or read does not take a chat out. Folder quiet hours ask this when a notification arrives, in the app and the extension.
++public func _internal_chatListFiltersIncludePeer(transaction: Transaction, filterIds: Set<Int32>, peerId: PeerId, accountPeerId: PeerId) -> Bool {
++    if filterIds.isEmpty {
++        return false
++    }
++    let filters = _internal_currentChatListFilters(transaction: transaction).filter { filterIds.contains($0.id) }
++    guard !filters.isEmpty, let peer = transaction.getPeer(peerId) else {
++        return false
++    }
++    // A secret chat counts as a contact by its user, as in the folder's own chat list.
++    let isContact = transaction.isPeerContact(peerId: peer.notificationSettingsPeerId ?? peer.id)
++    let groupId = transaction.getPeerChatListIndex(peerId).flatMap { EngineChatList.Group($0.0) }
++    return ChatListFiltersInclusion(filters: filters, accountPeerId: accountPeerId).includes(peer: EnginePeer(peer), groupId: groupId, isContact: isContact)
++}
++
++// The same rules for chats already at hand, built once for a whole chat list update. `groupId` is the chat's own
++// list; a chat that is in no list yet is taken in only as a folder's pinned chat.
++public struct ChatListFiltersInclusion {
++    private let predicates: [ChatListFilterPredicate]
++
++    public init(filters: [ChatListFilter], accountPeerId: EnginePeer.Id) {
++        self.predicates = filters.compactMap { filter -> ChatListFilterPredicate? in
++            guard case let .filter(_, _, _, data) = filter else {
++                return nil
++            }
++            var rules = data
++            rules.excludeMuted = false
++            rules.excludeRead = false
++            return chatListFilterPredicate(filter: rules, accountPeerId: accountPeerId)
++        }
++    }
++
++    public var isEmpty: Bool {
++        return self.predicates.isEmpty
++    }
++
++    public func includes(peer: EnginePeer, groupId: EngineChatList.Group?, isContact: Bool) -> Bool {
++        for predicate in self.predicates {
++            if predicate.pinnedPeerIds.contains(peer.id) {
++                return true
++            }
++            guard let groupId = groupId?._asGroup() else {
++                continue
++            }
++            if groupId != .root && !predicate.includeAdditionalPeerGroupIds.contains(groupId) {
++                continue
++            }
++            if predicate.includes(peer: peer._asPeer(), groupId: groupId, isRemovedFromTotalUnreadCount: false, isUnread: false, isContact: isContact, messageTagSummaryResult: nil) {
++                return true
++            }
++        }
++        return false
++    }
++}
++
+ func updateChatListFiltersState(transaction: Transaction, _ f: (ChatListFiltersState) -> ChatListFiltersState) -> ChatListFiltersState {
+     var result: ChatListFiltersState?
+     transaction.updatePreferencesEntry(key: PreferencesKeys.chatListFilters, { entry in
+diff --git a/submodules/TelegramCore/Sources/TelegramEngine/Peers/TelegramEnginePeers.swift b/submodules/TelegramCore/Sources/TelegramEngine/Peers/TelegramEnginePeers.swift
+index a5f736c0..5d13849b 100644
+--- a/submodules/TelegramCore/Sources/TelegramEngine/Peers/TelegramEnginePeers.swift
++++ b/submodules/TelegramCore/Sources/TelegramEngine/Peers/TelegramEnginePeers.swift
+@@ -995,6 +995,13 @@ public extension TelegramEngine {
+             }
+         }
+         
++        public func chatListFiltersIncludePeer(filterIds: Set<Int32>, peerId: EnginePeer.Id) -> Signal<Bool, NoError> {
++            let accountPeerId = self.account.peerId
++            return self.account.postbox.transaction { transaction -> Bool in
++                return _internal_chatListFiltersIncludePeer(transaction: transaction, filterIds: filterIds, peerId: peerId, accountPeerId: accountPeerId)
++            }
++        }
++        
+         public func setMainProfileTab(peerId: EnginePeer.Id, tab: TelegramProfileTab) -> Signal<Never, NoError> {
+             return _internal_setMainProfileTab(account: self.account, peerId: peerId, tab: tab)
+         }
+diff --git a/submodules/TelegramCore/Tests/ChatListFiltersInclusionTests.swift b/submodules/TelegramCore/Tests/ChatListFiltersInclusionTests.swift
+new file mode 100644
+index 00000000..e6894a94
+--- /dev/null
++++ b/submodules/TelegramCore/Tests/ChatListFiltersInclusionTests.swift
+@@ -0,0 +1,127 @@
++import XCTest
++import Postbox
++@testable import TelegramCore
++
++/// Which chats a folder's quiet hours silence: the chats the folder shows, by its own rules (chat types, included,
++/// excluded and pinned chats, archived chats), except that being muted or read does not take a chat out.
++final class ChatListFiltersInclusionTests: XCTestCase {
++    private let accountPeerId = PeerId(namespace: Namespaces.Peer.CloudUser, id: PeerId.Id._internalFromInt64Value(1))
++
++    private func user(_ id: Int64, bot: Bool = false) -> EnginePeer {
++        return EnginePeer(TelegramUser(
++            id: PeerId(namespace: Namespaces.Peer.CloudUser, id: PeerId.Id._internalFromInt64Value(id)),
++            accessHash: nil, firstName: "User", lastName: nil, username: nil, phone: nil, photo: [],
++            botInfo: bot ? BotUserInfo(flags: [], inlinePlaceholder: nil) : nil, restrictionInfo: nil, flags: [], emojiStatus: nil, usernames: [],
++            storiesHidden: nil, nameColor: nil, backgroundEmojiId: nil, profileColor: nil,
++            profileBackgroundEmojiId: nil, subscriberCount: nil, verificationIconFileId: nil
++        ))
++    }
++
++    private func group(_ id: Int64) -> EnginePeer {
++        return EnginePeer(TelegramGroup(id: PeerId(namespace: Namespaces.Peer.CloudGroup, id: PeerId.Id._internalFromInt64Value(id)), title: "Group", photo: [], participantCount: 3, role: .member, membership: .Member, flags: [], defaultBannedRights: nil, migrationReference: nil, creationDate: 0, version: 0))
++    }
++
++    private func channel(_ id: Int64) -> EnginePeer {
++        return EnginePeer(TelegramChannel(id: PeerId(namespace: Namespaces.Peer.CloudChannel, id: PeerId.Id._internalFromInt64Value(id)), accessHash: nil, title: "Channel", username: nil, photo: [], creationDate: 0, version: 0, participationStatus: .member, info: .broadcast(TelegramChannelBroadcastInfo(flags: [])), flags: [], restrictionInfo: nil, adminRights: nil, bannedRights: nil, defaultBannedRights: nil, usernames: [], storiesHidden: nil, nameColor: nil, backgroundEmojiId: nil, profileColor: nil, profileBackgroundEmojiId: nil, emojiStatus: nil, approximateBoostLevel: nil, subscriptionUntilDate: nil, verificationIconFileId: nil, sendPaidMessageStars: nil, linkedMonoforumId: nil))
++    }
++
++    private func secretChat(_ id: Int64, with user: EnginePeer) -> EnginePeer {
++        return EnginePeer(TelegramSecretChat(id: PeerId(namespace: Namespaces.Peer.SecretChat, id: PeerId.Id._internalFromInt64Value(id)), creationDate: 0, regularPeerId: user.id, accessHash: 0, role: .creator, embeddedState: .active, messageAutoremoveTimeout: nil))
++    }
++
++    private func folder(_ categories: ChatListFilterPeerCategories, include: [EnginePeer] = [], exclude: [EnginePeer] = [], pinned: [EnginePeer] = [], excludeMuted: Bool = false, excludeRead: Bool = false, excludeArchived: Bool = false) -> ChatListFilter {
++        var includePeers = ChatListFilterIncludePeers()
++        for peer in include {
++            let _ = includePeers.addPeer(peer.id)
++        }
++        for peer in pinned {
++            let _ = includePeers.addPinnedPeer(peer.id)
++        }
++        return .filter(id: 2, title: ChatFolderTitle(text: "Folder", entities: [], enableAnimations: false), emoticon: nil, data: ChatListFilterData(
++            isShared: false, hasSharedLinks: false, categories: categories, excludeMuted: excludeMuted, excludeRead: excludeRead,
++            excludeArchived: excludeArchived, includePeers: includePeers, excludePeers: exclude.map(\.id), color: nil
++        ))
++    }
++
++    private func isQuiet(_ peer: EnginePeer, in filters: [ChatListFilter], groupId: EngineChatList.Group? = .root, isContact: Bool = false) -> Bool {
++        return ChatListFiltersInclusion(filters: filters, accountPeerId: self.accountPeerId).includes(peer: peer, groupId: groupId, isContact: isContact)
++    }
++
++    func testChatTypes() {
++        let contact = self.user(10), stranger = self.user(11), bot = self.user(12, bot: true), group = self.group(20), channel = self.channel(30)
++        let groups = self.folder(.groups)
++        XCTAssertTrue(self.isQuiet(group, in: [groups]))
++        XCTAssertFalse(self.isQuiet(channel, in: [groups]))
++        XCTAssertFalse(self.isQuiet(contact, in: [groups], isContact: true))
++
++        let channels = self.folder(.channels)
++        XCTAssertTrue(self.isQuiet(channel, in: [channels]))
++        XCTAssertFalse(self.isQuiet(group, in: [channels]))
++
++        let contacts = self.folder(.contacts)
++        XCTAssertTrue(self.isQuiet(contact, in: [contacts], isContact: true))
++        XCTAssertFalse(self.isQuiet(stranger, in: [contacts]))
++
++        let nonContacts = self.folder(.nonContacts)
++        XCTAssertTrue(self.isQuiet(stranger, in: [nonContacts]))
++        XCTAssertFalse(self.isQuiet(contact, in: [nonContacts], isContact: true))
++
++        let bots = self.folder(.bots)
++        XCTAssertTrue(self.isQuiet(bot, in: [bots]))
++        XCTAssertFalse(self.isQuiet(stranger, in: [bots]))
++        XCTAssertFalse(self.isQuiet(bot, in: [nonContacts]))
++    }
++
++    func testIncludedExcludedAndPinnedChats() {
++        let anna = self.user(10), group = self.group(20), otherGroup = self.group(21), channel = self.channel(30)
++        // A folder of a list of chats, like "Work".
++        let work = self.folder([], include: [anna, group])
++        XCTAssertTrue(self.isQuiet(anna, in: [work]))
++        XCTAssertTrue(self.isQuiet(group, in: [work]))
++        XCTAssertFalse(self.isQuiet(otherGroup, in: [work]))
++
++        // An excluded chat stays out even when its type is in the folder.
++        let groupsButOne = self.folder(.groups, exclude: [otherGroup])
++        XCTAssertTrue(self.isQuiet(group, in: [groupsButOne]))
++        XCTAssertFalse(self.isQuiet(otherGroup, in: [groupsButOne]))
++
++        // A pinned chat is in the folder whatever its type, archived or not, even before it is in any chat list.
++        let groupsAndPinnedChannel = self.folder(.groups, pinned: [channel])
++        XCTAssertTrue(self.isQuiet(channel, in: [groupsAndPinnedChannel]))
++        XCTAssertTrue(self.isQuiet(channel, in: [groupsAndPinnedChannel], groupId: .archive))
++        XCTAssertTrue(self.isQuiet(channel, in: [groupsAndPinnedChannel], groupId: nil))
++        XCTAssertFalse(self.isQuiet(group, in: [groupsAndPinnedChannel], groupId: nil))
++    }
++
++    func testArchivedChats() {
++        let group = self.group(20)
++        XCTAssertTrue(self.isQuiet(group, in: [self.folder(.groups)], groupId: .archive))
++        XCTAssertFalse(self.isQuiet(group, in: [self.folder(.groups, excludeArchived: true)], groupId: .archive))
++        XCTAssertTrue(self.isQuiet(group, in: [self.folder(.groups, excludeArchived: true)], groupId: .root))
++    }
++
++    // A folder that hides muted or read chats still keeps its quiet hours for them: being muted or read is not a rule
++    // of which chats are in it, and quiet hours must not end for a chat once it has been read.
++    func testMutedAndReadChatsStayIn() {
++        let group = self.group(20)
++        let unreadUnmutedGroups = self.folder(.groups, excludeMuted: true, excludeRead: true)
++        XCTAssertTrue(self.isQuiet(group, in: [unreadUnmutedGroups]))
++    }
++
++    // A secret chat is a contact's chat when its user is a contact, as in the folder's own chat list.
++    func testSecretChatsFollowTheirUser() {
++        let secret = self.secretChat(40, with: self.user(10))
++        XCTAssertTrue(self.isQuiet(secret, in: [self.folder(.contacts)], isContact: true))
++        XCTAssertFalse(self.isQuiet(secret, in: [self.folder(.nonContacts)], isContact: true))
++        XCTAssertTrue(self.isQuiet(secret, in: [self.folder(.nonContacts)], isContact: false))
++    }
++
++    // A chat in several folders is quiet while any of them is.
++    func testAnyOfSeveralFolders() {
++        let mike = self.user(10)
++        let work = self.folder([], include: [mike]), personal = self.folder(.groups)
++        XCTAssertTrue(self.isQuiet(mike, in: [personal, work]))
++        XCTAssertFalse(self.isQuiet(mike, in: [personal]))
++        XCTAssertFalse(self.isQuiet(mike, in: []))
++    }
++}
+diff --git a/submodules/TelegramUI/Components/Settings/FolderNotificationScheduleScreen/BUILD b/submodules/TelegramUI/Components/Settings/FolderNotificationScheduleScreen/BUILD
+new file mode 100644
+index 00000000..cceab9e1
+--- /dev/null
++++ b/submodules/TelegramUI/Components/Settings/FolderNotificationScheduleScreen/BUILD
+@@ -0,0 +1,40 @@
++load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
++
++swift_library(
++    name = "FolderNotificationScheduleScreen",
++    module_name = "FolderNotificationScheduleScreen",
++    srcs = glob([
++        "Sources/**/*.swift",
++    ]),
++    copts = [
++        "-warnings-as-errors",
++    ],
++    deps = [
++        "//submodules/AsyncDisplayKit",
++        "//submodules/LottieSettings:LottieSettings",
++        "//submodules/Display",
++        "//submodules/TelegramCore",
++        "//submodules/SSignalKit/SwiftSignalKit",
++        "//submodules/TelegramPresentationData",
++        "//submodules/TelegramUIPreferences",
++        "//submodules/AccountContext",
++        "//submodules/PresentationDataUtils",
++        "//submodules/ComponentFlow",
++        "//submodules/Components/ViewControllerComponent",
++        "//submodules/Components/BundleIconComponent",
++        "//submodules/Components/MultilineTextComponent",
++        "//submodules/Components/MultilineTextWithEntitiesComponent",
++        "//submodules/Components/BalancedTextComponent",
++        "//submodules/TelegramUI/Components/ListSectionComponent",
++        "//submodules/TelegramUI/Components/ListActionItemComponent",
++        "//submodules/TelegramUI/Components/LottieComponent",
++        "//submodules/TelegramUI/Components/PlainButtonComponent",
++        "//submodules/TelegramStringFormatting",
++        "//submodules/TextFormat",
++        "//submodules/TelegramUI/Components/ChatTimerScreen",
++        "//submodules/FolderNotificationSchedule",
++    ],
++    visibility = [
++        "//visibility:public",
++    ],
++)
+diff --git a/submodules/TelegramUI/Components/Settings/FolderNotificationScheduleScreen/Sources/FolderNotificationScheduleDaysComponent.swift b/submodules/TelegramUI/Components/Settings/FolderNotificationScheduleScreen/Sources/FolderNotificationScheduleDaysComponent.swift
+new file mode 100644
+index 00000000..07ee128d
+--- /dev/null
++++ b/submodules/TelegramUI/Components/Settings/FolderNotificationScheduleScreen/Sources/FolderNotificationScheduleDaysComponent.swift
+@@ -0,0 +1,138 @@
++import Foundation
++import UIKit
++import Display
++import ComponentFlow
++import TelegramPresentationData
++import ListSectionComponent
++import FolderNotificationSchedule
++
++// A row of seven round day buttons, Monday first (as in Business Hours), like the Focus and Sleep
++// schedules of iOS. It is a row of its own in the section: a list item's title does not take touches.
++final class FolderNotificationScheduleDaysComponent: Component {
++    let theme: PresentationTheme
++    let shortNames: [String]
++    let fullNames: [String]
++    let days: FolderNotificationSchedule.Days
++    let toggle: (Int) -> Void
++
++    init(theme: PresentationTheme, shortNames: [String], fullNames: [String], days: FolderNotificationSchedule.Days, toggle: @escaping (Int) -> Void) {
++        self.theme = theme
++        self.shortNames = shortNames
++        self.fullNames = fullNames
++        self.days = days
++        self.toggle = toggle
++    }
++
++    static func ==(lhs: FolderNotificationScheduleDaysComponent, rhs: FolderNotificationScheduleDaysComponent) -> Bool {
++        if lhs.theme !== rhs.theme {
++            return false
++        }
++        if lhs.shortNames != rhs.shortNames || lhs.fullNames != rhs.fullNames {
++            return false
++        }
++        if lhs.days != rhs.days {
++            return false
++        }
++        return true
++    }
++
++    private final class DayButton: HighlightTrackingButton {
++        let background = UIView()
++        let label = ImmediateTextView()
++
++        override init(frame: CGRect) {
++            super.init(frame: frame)
++            self.background.isUserInteractionEnabled = false
++            self.addSubview(self.background)
++            self.label.isUserInteractionEnabled = false
++            self.addSubview(self.label)
++            self.isAccessibilityElement = true
++            self.highligthedChanged = { [weak self] highlighted in
++                guard let self else {
++                    return
++                }
++                if highlighted {
++                    self.background.layer.removeAnimation(forKey: "transform.scale")
++                    self.background.layer.transform = CATransform3DMakeScale(0.9, 0.9, 1.0)
++                } else {
++                    let transition = ComponentTransition(animation: .curve(duration: 0.25, curve: .spring))
++                    transition.setScale(view: self.background, scale: 1.0)
++                }
++            }
++        }
++
++        required init?(coder: NSCoder) {
++            fatalError("init(coder:) has not been implemented")
++        }
++    }
++
++    final class View: UIView, ListSectionComponent.ChildView {
++        private var buttons: [DayButton] = []
++        private var component: FolderNotificationScheduleDaysComponent?
++
++        var customUpdateIsHighlighted: ((Bool) -> Void)?
++        var enumerateSiblings: (((UIView) -> Void) -> Void)?
++        private(set) var separatorInset: CGFloat = 16.0
++
++        override init(frame: CGRect) {
++            super.init(frame: frame)
++            for index in 0 ..< 7 {
++                let button = DayButton()
++                button.tag = index
++                button.addTarget(self, action: #selector(self.buttonPressed(_:)), for: .touchUpInside)
++                self.buttons.append(button)
++                self.addSubview(button)
++            }
++        }
++
++        required init?(coder: NSCoder) {
++            fatalError("init(coder:) has not been implemented")
++        }
++
++        @objc private func buttonPressed(_ button: UIButton) {
++            self.component?.toggle(button.tag)
++        }
++
++        func update(component: FolderNotificationScheduleDaysComponent, availableSize: CGSize, transition: ComponentTransition) -> CGSize {
++            self.component = component
++
++            let sideInset: CGFloat = 16.0
++            let verticalInset: CGFloat = 12.0
++            let contentWidth = availableSize.width - sideInset * 2.0
++            let count: CGFloat = 7.0
++            let diameter: CGFloat = min(40.0, floor((contentWidth - 6.0 * 4.0) / count))
++            let spacing: CGFloat = floor((contentWidth - diameter * count) / (count - 1.0))
++            let totalWidth = diameter * count + spacing * (count - 1.0)
++            let originX = floor((availableSize.width - totalWidth) / 2.0)
++
++            for (index, button) in self.buttons.enumerated() {
++                let isSelected = component.days.contains(dayIndex: index)
++                let frame = CGRect(origin: CGPoint(x: originX + CGFloat(index) * (diameter + spacing), y: verticalInset), size: CGSize(width: diameter, height: diameter))
++                transition.setFrame(view: button, frame: frame)
++                button.background.frame = CGRect(origin: CGPoint(), size: frame.size)
++                button.background.layer.cornerRadius = diameter / 2.0
++
++                let fillColor = isSelected ? component.theme.list.itemCheckColors.fillColor : component.theme.list.itemPrimaryTextColor.withMultipliedAlpha(0.08)
++                let textColor = isSelected ? component.theme.list.itemCheckColors.foregroundColor : component.theme.list.itemPrimaryTextColor
++                transition.setBackgroundColor(view: button.background, color: fillColor)
++
++                button.label.attributedText = NSAttributedString(string: component.shortNames[index], font: Font.semibold(13.0), textColor: textColor)
++                let labelSize = button.label.updateLayout(CGSize(width: diameter, height: diameter))
++                button.label.frame = CGRect(origin: CGPoint(x: floor((diameter - labelSize.width) / 2.0), y: floor((diameter - labelSize.height) / 2.0)), size: labelSize)
++
++                button.accessibilityLabel = component.fullNames[index]
++                button.accessibilityTraits = isSelected ? [.button, .selected] : [.button]
++            }
++
++            return CGSize(width: availableSize.width, height: diameter + verticalInset * 2.0)
++        }
++    }
++
++    func makeView() -> View {
++        return View(frame: CGRect())
++    }
++
++    func update(view: View, availableSize: CGSize, state: EmptyComponentState, environment: Environment<Empty>, transition: ComponentTransition) -> CGSize {
++        return view.update(component: self, availableSize: availableSize, transition: transition)
++    }
++}
+diff --git a/submodules/TelegramUI/Components/Settings/FolderNotificationScheduleScreen/Sources/FolderNotificationScheduleScreen.swift b/submodules/TelegramUI/Components/Settings/FolderNotificationScheduleScreen/Sources/FolderNotificationScheduleScreen.swift
+new file mode 100644
+index 00000000..bbef6daa
+--- /dev/null
++++ b/submodules/TelegramUI/Components/Settings/FolderNotificationScheduleScreen/Sources/FolderNotificationScheduleScreen.swift
+@@ -0,0 +1,723 @@
++import Foundation
++import UIKit
++import Display
++import AsyncDisplayKit
++import SwiftSignalKit
++import TelegramCore
++import TelegramPresentationData
++import TelegramUIPreferences
++import PresentationDataUtils
++import AccountContext
++import ComponentFlow
++import ViewControllerComponent
++import MultilineTextComponent
++import MultilineTextWithEntitiesComponent
++import BalancedTextComponent
++import ListSectionComponent
++import ListActionItemComponent
++import BundleIconComponent
++import LottieComponent
++import LottieSettings
++import PlainButtonComponent
++import ChatTimerScreen
++import FolderNotificationSchedule
++
++// Quiet hours of one chat folder: when its chats stay silent. Built like Business Hours: the screen is
++// a list of sections, times are picked with the time-of-day sheet, and changes are saved when the
++// screen is left.
++final class FolderNotificationScheduleScreenComponent: Component {
++    typealias EnvironmentType = ViewControllerComponentContainer.Environment
++
++    let context: AccountContext
++    let folderTitle: ChatFolderTitle
++    let initialEntry: FolderNotificationScheduleEntry?
++    let completion: (FolderNotificationScheduleEntry) -> Void
++
++    init(context: AccountContext, folderTitle: ChatFolderTitle, initialEntry: FolderNotificationScheduleEntry?, completion: @escaping (FolderNotificationScheduleEntry) -> Void) {
++        self.context = context
++        self.folderTitle = folderTitle
++        self.initialEntry = initialEntry
++        self.completion = completion
++    }
++
++    static func ==(lhs: FolderNotificationScheduleScreenComponent, rhs: FolderNotificationScheduleScreenComponent) -> Bool {
++        if lhs.context !== rhs.context {
++            return false
++        }
++        if lhs.folderTitle != rhs.folderTitle {
++            return false
++        }
++        if lhs.initialEntry != rhs.initialEntry {
++            return false
++        }
++        return true
++    }
++
++    private final class ScrollView: UIScrollView {
++        override func touchesShouldCancel(in view: UIView) -> Bool {
++            return true
++        }
++    }
++
++    // One set of quiet hours as edited on screen.
++    struct Window: Equatable {
++        var id: Int
++        var days: FolderNotificationSchedule.Days
++        var startMinute: Int32
++        var endMinute: Int32
++        var isAllDay: Bool
++
++        init(id: Int, schedule: FolderNotificationSchedule) {
++            self.id = id
++            self.days = schedule.days
++            // "All Day" is midnight to midnight; equal times elsewhere are 24 hours from that time and keep it.
++            self.isAllDay = schedule.isWholeDay && schedule.startMinute == 0
++            if self.isAllDay {
++                self.startMinute = Window.defaultStartMinute
++                self.endMinute = Window.defaultEndMinute
++            } else {
++                self.startMinute = schedule.startMinute
++                self.endMinute = schedule.endMinute
++            }
++        }
++
++        init(id: Int, days: FolderNotificationSchedule.Days, startMinute: Int32, endMinute: Int32, isAllDay: Bool) {
++            self.id = id
++            self.days = days
++            self.startMinute = startMinute
++            self.endMinute = endMinute
++            self.isAllDay = isAllDay
++        }
++
++        // A first set of quiet hours covers the night; an added one keeps the weekend quiet.
++        static let defaultStartMinute: Int32 = 22 * 60
++        static let defaultEndMinute: Int32 = 8 * 60
++
++        var schedule: FolderNotificationSchedule {
++            if self.isAllDay {
++                return FolderNotificationSchedule(days: self.days, startMinute: 0, endMinute: 0)
++            }
++            return FolderNotificationSchedule(days: self.days, startMinute: self.startMinute, endMinute: self.endMinute)
++        }
++    }
++
++    final class View: UIView, UIScrollViewDelegate {
++        private let topOverscrollLayer = SimpleLayer()
++        private let scrollView: ScrollView
++
++        private let navigationTitle = ComponentView<Empty>()
++        private let icon = ComponentView<Empty>()
++        private let subtitle = ComponentView<Empty>()
++        private let generalSection = ComponentView<Empty>()
++        private var windowSections: [Int: ComponentView<Empty>] = [:]
++        private let addSection = ComponentView<Empty>()
++
++        private var isUpdating: Bool = false
++
++        private var component: FolderNotificationScheduleScreenComponent?
++        private(set) weak var state: EmptyComponentState?
++        private var environment: EnvironmentType?
++
++        private var isEnabled: Bool = false
++        private var windows: [Window] = []
++        private var nextWindowId: Int = 0
++        private let hapticFeedback = HapticFeedback()
++        private var savedEntry: FolderNotificationScheduleEntry?
++
++        override init(frame: CGRect) {
++            self.scrollView = ScrollView()
++            self.scrollView.showsVerticalScrollIndicator = true
++            self.scrollView.showsHorizontalScrollIndicator = false
++            self.scrollView.scrollsToTop = false
++            self.scrollView.delaysContentTouches = false
++            self.scrollView.canCancelContentTouches = true
++            self.scrollView.contentInsetAdjustmentBehavior = .never
++            if #available(iOS 13.0, *) {
++                self.scrollView.automaticallyAdjustsScrollIndicatorInsets = false
++            }
++            self.scrollView.alwaysBounceVertical = true
++
++            super.init(frame: frame)
++
++            self.scrollView.delegate = self
++            self.addSubview(self.scrollView)
++
++            self.scrollView.layer.addSublayer(self.topOverscrollLayer)
++        }
++
++        required init?(coder: NSCoder) {
++            fatalError("init(coder:) has not been implemented")
++        }
++
++        func scrollToTop() {
++            self.scrollView.setContentOffset(CGPoint(), animated: true)
++        }
++
++        var currentEntry: FolderNotificationScheduleEntry {
++            return FolderNotificationScheduleEntry(isEnabled: self.isEnabled, schedules: self.windows.map(\.schedule))
++        }
++
++        // Saves each change once, when the screen has gone: back, or a chat opened on top of it.
++        func save() {
++            guard let component = self.component else {
++                return
++            }
++            let entry = self.currentEntry
++            if let savedEntry = self.savedEntry ?? component.initialEntry {
++                if entry != savedEntry {
++                    self.savedEntry = entry
++                    component.completion(entry)
++                }
++            } else if entry.isEnabled {
++                self.savedEntry = entry
++                component.completion(entry)
++            }
++        }
++
++        func scrollViewDidScroll(_ scrollView: UIScrollView) {
++        }
++
++        private func openTimePicker(windowId: Int, isStart: Bool) {
++            guard let component = self.component, let window = self.windows.first(where: { $0.id == windowId }) else {
++                return
++            }
++            let controller = ChatTimerScreen(
++                context: component.context,
++                configuration: ChatTimerScreen.Configuration(
++                    style: .default,
++                    picker: .timeOfDay,
++                    currentValue: (isStart ? window.startMinute : window.endMinute) * 60,
++                    pickerValueMapping: .secondsFromMidnightGMT,
++                    primaryActionTitle: { strings, _, _ in
++                        strings.Wallpaper_Set
++                    }
++                ),
++                completion: { [weak self] value in
++                    guard let self, let value else {
++                        return
++                    }
++                    guard let index = self.windows.firstIndex(where: { $0.id == windowId }) else {
++                        return
++                    }
++                    let minute = (value / 60) % FolderNotificationSchedule.minutesPerDay
++                    // Kept as picked, even equal to the other end (24 hours, ending the next day): the
++                    // user is usually on the way to changing that end too.
++                    if isStart {
++                        self.windows[index].startMinute = minute
++                    } else {
++                        self.windows[index].endMinute = minute
++                    }
++                    self.state?.updated(transition: .spring(duration: 0.4))
++                }
++            )
++            self.environment?.controller()?.present(controller, in: .window(.root))
++        }
++
++        private func toggleDay(windowId: Int, dayIndex: Int) {
++            guard let index = self.windows.firstIndex(where: { $0.id == windowId }) else {
++                return
++            }
++            let day = FolderNotificationSchedule.Days(dayIndex: dayIndex)
++            var days = self.windows[index].days
++            if days.contains(day) {
++                // Quiet hours run on at least one day.
++                if days == day {
++                    self.hapticFeedback.error()
++                    return
++                }
++                days.remove(day)
++            } else {
++                days.insert(day)
++            }
++            self.hapticFeedback.impact(.light)
++            self.windows[index].days = days
++            self.state?.updated(transition: .immediate)
++        }
++
++        func update(component: FolderNotificationScheduleScreenComponent, availableSize: CGSize, state: EmptyComponentState, environment: Environment<EnvironmentType>, transition: ComponentTransition) -> CGSize {
++            self.isUpdating = true
++            defer {
++                self.isUpdating = false
++            }
++
++            if self.component == nil {
++                if let entry = component.initialEntry, !entry.schedules.isEmpty {
++                    self.isEnabled = entry.isEnabled
++                    self.windows = entry.schedules.enumerated().map { Window(id: $0.offset, schedule: $0.element) }
++                    self.nextWindowId = self.windows.count
++                } else {
++                    self.isEnabled = false
++                    self.windows = [Window(id: 0, days: .everyDay, startMinute: Window.defaultStartMinute, endMinute: Window.defaultEndMinute, isAllDay: false)]
++                    self.nextWindowId = 1
++                }
++            }
++
++            let environment = environment[EnvironmentType.self].value
++            let themeUpdated = self.environment?.theme !== environment.theme
++            self.environment = environment
++
++            self.component = component
++            self.state = state
++
++            if themeUpdated {
++                self.backgroundColor = environment.theme.list.blocksBackgroundColor
++            }
++
++            let presentationData = component.context.sharedContext.currentPresentationData.with { $0 }
++            let strings = environment.strings
++            let theme = environment.theme
++
++            let navigationTitleSize = self.navigationTitle.update(
++                transition: transition,
++                component: AnyComponent(MultilineTextComponent(
++                    text: .plain(NSAttributedString(string: strings.FolderQuietHours_Title, font: Font.semibold(17.0), textColor: theme.rootController.navigationBar.primaryTextColor)),
++                    horizontalAlignment: .center
++                )),
++                environment: {},
++                containerSize: CGSize(width: availableSize.width, height: 100.0)
++            )
++            let navigationTitleFrame = CGRect(origin: CGPoint(x: floor(environment.safeInsets.left + (availableSize.width - environment.safeInsets.left - environment.safeInsets.right - navigationTitleSize.width) / 2.0), y: environment.statusBarHeight + floor((environment.navigationHeight - environment.statusBarHeight - navigationTitleSize.height) / 2.0)), size: navigationTitleSize)
++            if let navigationTitleView = self.navigationTitle.view {
++                if navigationTitleView.superview == nil {
++                    if let controller = self.environment?.controller(), let navigationBar = controller.navigationBar {
++                        navigationBar.view.addSubview(navigationTitleView)
++                    }
++                }
++                transition.setFrame(view: navigationTitleView, frame: navigationTitleFrame)
++            }
++
++            let bottomContentInset: CGFloat = 24.0
++            let sideInset: CGFloat = 16.0 + environment.safeInsets.left
++            let rightSideInset: CGFloat = 16.0 + environment.safeInsets.right
++            let bandCenterX: CGFloat = environment.safeInsets.left + (availableSize.width - environment.safeInsets.left - environment.safeInsets.right) / 2.0
++            let sectionSpacing: CGFloat = 30.0
++            let sectionWidth = availableSize.width - sideInset - rightSideInset
++
++            var contentHeight: CGFloat = 0.0
++            contentHeight += environment.navigationHeight
++
++            let iconSize = self.icon.update(
++                transition: .immediate,
++                component: AnyComponent(LottieComponent(
++                    content: LottieComponent.AppBundleContent(name: "ZzzEmoji"),
++                    loop: false,
++                    lottieSettings: component.context.lottieRenderingSettings
++                )),
++                environment: {},
++                containerSize: CGSize(width: 100.0, height: 100.0)
++            )
++            let iconFrame = CGRect(origin: CGPoint(x: floor(bandCenterX - iconSize.width * 0.5), y: contentHeight + 10.0), size: iconSize)
++            if let iconView = self.icon.view as? LottieComponent.View {
++                if iconView.superview == nil {
++                    self.scrollView.addSubview(iconView)
++                    iconView.playOnce()
++                }
++                transition.setPosition(view: iconView, position: iconFrame.center)
++                iconView.bounds = CGRect(origin: CGPoint(), size: iconFrame.size)
++            }
++            contentHeight += 126.0
++
++            // The folder's title goes in as it is shown on its tab, custom emoji included.
++            let subtitleString = NSMutableAttributedString(string: strings.FolderQuietHours_Text)
++            subtitleString.addAttributes([
++                .font: Font.regular(15.0),
++                .foregroundColor: theme.list.freeTextColor
++            ], range: NSRange(location: 0, length: subtitleString.length))
++            let folderRange = (subtitleString.string as NSString).range(of: "{folder}")
++            if folderRange.location != NSNotFound {
++                subtitleString.replaceCharacters(in: folderRange, with: "")
++                subtitleString.insert(component.folderTitle.attributedString(font: Font.semibold(15.0), textColor: theme.list.freeTextColor), at: folderRange.location)
++            }
++            let subtitleComponent: AnyComponent<Empty>
++            if component.folderTitle.entities.isEmpty {
++                subtitleComponent = AnyComponent(BalancedTextComponent(
++                    text: .plain(subtitleString),
++                    horizontalAlignment: .center,
++                    maximumNumberOfLines: 0,
++                    lineSpacing: 0.25
++                ))
++            } else {
++                subtitleComponent = AnyComponent(MultilineTextWithEntitiesComponent(
++                    context: component.context,
++                    animationCache: component.context.animationCache,
++                    animationRenderer: component.context.animationRenderer,
++                    placeholderColor: theme.list.freeTextColor.withMultipliedAlpha(0.1),
++                    text: .plain(subtitleString),
++                    horizontalAlignment: .center,
++                    maximumNumberOfLines: 0,
++                    lineSpacing: 0.25,
++                    enableLooping: component.folderTitle.enableAnimations
++                ))
++            }
++            let subtitleSize = self.subtitle.update(
++                transition: .immediate,
++                component: subtitleComponent,
++                environment: {},
++                containerSize: CGSize(width: sectionWidth, height: 1000.0)
++            )
++            let subtitleFrame = CGRect(origin: CGPoint(x: floor(bandCenterX - subtitleSize.width * 0.5), y: contentHeight), size: subtitleSize)
++            if let subtitleView = self.subtitle.view {
++                if subtitleView.superview == nil {
++                    self.scrollView.addSubview(subtitleView)
++                }
++                transition.setPosition(view: subtitleView, position: subtitleFrame.center)
++                subtitleView.bounds = CGRect(origin: CGPoint(), size: subtitleFrame.size)
++            }
++            contentHeight += subtitleSize.height
++            contentHeight += 27.0
++
++            let listFont = Font.regular(presentationData.listsFontSize.baseDisplaySize)
++            let headerFont = Font.regular(presentationData.listsFontSize.itemListBaseHeaderFontSize)
++
++            let generalSectionSize = self.generalSection.update(
++                transition: transition,
++                component: AnyComponent(ListSectionComponent(
++                    theme: theme,
++                    style: .glass,
++                    header: nil,
++                    footer: nil,
++                    items: [
++                        AnyComponentWithIdentity(id: 0, component: AnyComponent(ListActionItemComponent(
++                            theme: theme,
++                            style: .glass,
++                            title: AnyComponent(MultilineTextComponent(
++                                text: .plain(NSAttributedString(string: strings.FolderQuietHours_MainToggle, font: listFont, textColor: theme.list.itemPrimaryTextColor)),
++                                maximumNumberOfLines: 1
++                            )),
++                            accessory: .toggle(ListActionItemComponent.Toggle(style: .regular, isOn: self.isEnabled, action: { [weak self] _ in
++                                guard let self else {
++                                    return
++                                }
++                                self.isEnabled = !self.isEnabled
++                                self.state?.updated(transition: .spring(duration: 0.4))
++                            })),
++                            action: nil
++                        )))
++                    ]
++                )),
++                environment: {},
++                containerSize: CGSize(width: sectionWidth, height: 10000.0)
++            )
++            let generalSectionFrame = CGRect(origin: CGPoint(x: sideInset, y: contentHeight), size: generalSectionSize)
++            if let generalSectionView = self.generalSection.view {
++                if generalSectionView.superview == nil {
++                    self.scrollView.addSubview(generalSectionView)
++                }
++                transition.setFrame(view: generalSectionView, frame: generalSectionFrame)
++            }
++            contentHeight += generalSectionSize.height
++            contentHeight += sectionSpacing
++
++            let shortNames = folderNotificationScheduleShortDayNames(strings: strings)
++            let fullNames = folderNotificationScheduleFullDayNames(strings: strings)
++            let alphaTransition: ComponentTransition = transition.animation.isImmediate ? transition : .easeInOut(duration: 0.25)
++
++            var windowsHeight: CGFloat = 0.0
++            for window in self.windows {
++                let windowId = window.id
++                var sectionTransition = transition
++                let section: ComponentView<Empty>
++                if let current = self.windowSections[windowId] {
++                    section = current
++                } else {
++                    section = ComponentView()
++                    self.windowSections[windowId] = section
++                    sectionTransition = sectionTransition.withAnimation(.none)
++                }
++
++                var items: [AnyComponentWithIdentity<Empty>] = []
++                items.append(AnyComponentWithIdentity(id: "days", component: AnyComponent(FolderNotificationScheduleDaysComponent(
++                    theme: theme,
++                    shortNames: shortNames,
++                    fullNames: fullNames,
++                    days: window.days,
++                    toggle: { [weak self] dayIndex in
++                        self?.toggleDay(windowId: windowId, dayIndex: dayIndex)
++                    }
++                ))))
++                items.append(AnyComponentWithIdentity(id: "allDay", component: AnyComponent(ListActionItemComponent(
++                    theme: theme,
++                    style: .glass,
++                    title: AnyComponent(MultilineTextComponent(
++                        text: .plain(NSAttributedString(string: strings.FolderQuietHours_AllDay, font: listFont, textColor: theme.list.itemPrimaryTextColor)),
++                        maximumNumberOfLines: 1
++                    )),
++                    accessory: .toggle(ListActionItemComponent.Toggle(style: .regular, isOn: window.isAllDay, action: { [weak self] _ in
++                        guard let self, let index = self.windows.firstIndex(where: { $0.id == windowId }) else {
++                            return
++                        }
++                        self.windows[index].isAllDay = !self.windows[index].isAllDay
++                        self.state?.updated(transition: .spring(duration: 0.4))
++                    })),
++                    action: nil
++                ))))
++                if !window.isAllDay {
++                    for isStart in [true, false] {
++                        let minute = isStart ? window.startMinute : window.endMinute
++                        let timeText = folderNotificationScheduleTimeText(minute: minute, dateTimeFormat: presentationData.dateTimeFormat)
++                        var titleItems: [AnyComponentWithIdentity<Empty>] = [
++                            AnyComponentWithIdentity(id: AnyHashable(0), component: AnyComponent(MultilineTextComponent(
++                                text: .plain(NSAttributedString(string: isStart ? strings.FolderQuietHours_From : strings.FolderQuietHours_To, font: listFont, textColor: theme.list.itemPrimaryTextColor)),
++                                maximumNumberOfLines: 1
++                            )))
++                        ]
++                        if !isStart && window.endMinute <= window.startMinute {
++                            titleItems.append(AnyComponentWithIdentity(id: AnyHashable(1), component: AnyComponent(MultilineTextComponent(
++                                text: .plain(NSAttributedString(string: strings.FolderQuietHours_NextDay, font: Font.regular(floor(presentationData.listsFontSize.baseDisplaySize * 13.0 / 17.0)), textColor: theme.list.itemSecondaryTextColor)),
++                                maximumNumberOfLines: 1
++                            ))))
++                        }
++                        items.append(AnyComponentWithIdentity(id: isStart ? "from" : "to", component: AnyComponent(ListActionItemComponent(
++                            theme: theme,
++                            style: .glass,
++                            title: AnyComponent(VStack(titleItems, alignment: .left, spacing: 2.0)),
++                            icon: ListActionItemComponent.Icon(component: AnyComponentWithIdentity(id: 0, component: AnyComponent(PlainButtonComponent(
++                                content: AnyComponent(MultilineTextComponent(
++                                    text: .plain(NSAttributedString(string: timeText, font: Font.regular(17.0), textColor: theme.list.itemPrimaryTextColor))
++                                )),
++                                background: AnyComponent(RoundedRectangle(color: theme.list.itemPrimaryTextColor.withMultipliedAlpha(0.1), cornerRadius: 6.0)),
++                                effectAlignment: .center,
++                                minSize: nil,
++                                contentInsets: UIEdgeInsets(top: 7.0, left: 8.0, bottom: 7.0, right: 8.0),
++                                action: { [weak self] in
++                                    self?.openTimePicker(windowId: windowId, isStart: isStart)
++                                },
++                                animateAlpha: true,
++                                animateScale: false
++                            ))), insets: .custom(UIEdgeInsets(top: 4.0, left: 0.0, bottom: 4.0, right: 0.0)), allowUserInteraction: true),
++                            accessory: nil,
++                            action: { [weak self] _ in
++                                self?.openTimePicker(windowId: windowId, isStart: isStart)
++                            }
++                        ))))
++                    }
++                }
++                if self.windows.count > 1 {
++                    items.append(AnyComponentWithIdentity(id: "remove", component: AnyComponent(ListActionItemComponent(
++                        theme: theme,
++                        style: .glass,
++                        title: AnyComponent(MultilineTextComponent(
++                            text: .plain(NSAttributedString(string: strings.FolderQuietHours_Remove, font: listFont, textColor: theme.list.itemDestructiveColor)),
++                            maximumNumberOfLines: 1
++                        )),
++                        accessory: nil,
++                        action: { [weak self] _ in
++                            guard let self else {
++                                return
++                            }
++                            self.windows.removeAll(where: { $0.id == windowId })
++                            self.state?.updated(transition: .spring(duration: 0.4))
++                        }
++                    ))))
++                }
++
++                var footer: AnyComponent<Empty>?
++                if !window.isAllDay && window.endMinute <= window.startMinute {
++                    let endText = folderNotificationScheduleTimeText(minute: window.endMinute, dateTimeFormat: presentationData.dateTimeFormat)
++                    footer = AnyComponent(MultilineTextComponent(
++                        text: .plain(NSAttributedString(string: strings.FolderQuietHours_NightFooter.replacingOccurrences(of: "{time}", with: endText), font: headerFont, textColor: theme.list.freeTextColor)),
++                        maximumNumberOfLines: 0
++                    ))
++                }
++
++                let sectionSize = section.update(
++                    transition: sectionTransition,
++                    component: AnyComponent(ListSectionComponent(
++                        theme: theme,
++                        style: .glass,
++                        header: nil,
++                        footer: footer,
++                        items: items
++                    )),
++                    environment: {},
++                    containerSize: CGSize(width: sectionWidth, height: 10000.0)
++                )
++                let sectionFrame = CGRect(origin: CGPoint(x: sideInset, y: contentHeight + windowsHeight), size: sectionSize)
++                if let sectionView = section.view {
++                    var animateIn = false
++                    if sectionView.superview == nil {
++                        animateIn = true
++                        sectionView.layer.allowsGroupOpacity = true
++                        self.scrollView.addSubview(sectionView)
++                    }
++                    sectionTransition.setFrame(view: sectionView, frame: sectionFrame)
++                    if self.isEnabled {
++                        if animateIn && !transition.animation.isImmediate {
++                            alphaTransition.animateAlpha(view: sectionView, from: 0.0, to: 1.0)
++                            transition.animateScale(view: sectionView, from: 0.001, to: 1.0)
++                        } else {
++                            alphaTransition.setAlpha(view: sectionView, alpha: 1.0)
++                        }
++                    } else {
++                        alphaTransition.setAlpha(view: sectionView, alpha: 0.0)
++                    }
++                    sectionView.isUserInteractionEnabled = self.isEnabled
++                }
++                windowsHeight += sectionSize.height
++                windowsHeight += sectionSpacing
++            }
++
++            var removedWindowIds: [Int] = []
++            for (id, section) in self.windowSections where !self.windows.contains(where: { $0.id == id }) {
++                removedWindowIds.append(id)
++                if let sectionView = section.view {
++                    if !transition.animation.isImmediate {
++                        ComponentTransition.easeInOut(duration: 0.2).setAlpha(view: sectionView, alpha: 0.0, completion: { [weak sectionView] _ in
++                            sectionView?.removeFromSuperview()
++                        })
++                        transition.setScale(view: sectionView, scale: 0.001)
++                    } else {
++                        sectionView.removeFromSuperview()
++                    }
++                }
++            }
++            for id in removedWindowIds {
++                self.windowSections.removeValue(forKey: id)
++            }
++
++            let addSectionSize = self.addSection.update(
++                transition: transition,
++                component: AnyComponent(ListSectionComponent(
++                    theme: theme,
++                    style: .glass,
++                    header: nil,
++                    footer: AnyComponent(MultilineTextComponent(
++                        text: .plain(NSAttributedString(string: strings.FolderQuietHours_AddFooter, font: headerFont, textColor: theme.list.freeTextColor)),
++                        maximumNumberOfLines: 0
++                    )),
++                    items: [
++                        AnyComponentWithIdentity(id: 0, component: AnyComponent(ListActionItemComponent(
++                            theme: theme,
++                            style: .glass,
++                            title: AnyComponent(MultilineTextComponent(
++                                text: .plain(NSAttributedString(string: strings.FolderQuietHours_Add, font: listFont, textColor: theme.list.itemAccentColor)),
++                                maximumNumberOfLines: 1
++                            )),
++                            leftIcon: .custom(AnyComponentWithIdentity(id: 0, component: AnyComponent(BundleIconComponent(
++                                name: "Item List/AddTimeIcon",
++                                tintColor: theme.list.itemAccentColor
++                            ))), false),
++                            accessory: nil,
++                            action: { [weak self] _ in
++                                guard let self else {
++                                    return
++                                }
++                                let id = self.nextWindowId
++                                self.nextWindowId += 1
++                                self.windows.append(Window(id: id, days: .weekends, startMinute: Window.defaultStartMinute, endMinute: Window.defaultEndMinute, isAllDay: true))
++                                self.state?.updated(transition: .spring(duration: 0.4))
++                            }
++                        )))
++                    ]
++                )),
++                environment: {},
++                containerSize: CGSize(width: sectionWidth, height: 10000.0)
++            )
++            let addSectionFrame = CGRect(origin: CGPoint(x: sideInset, y: contentHeight + windowsHeight), size: addSectionSize)
++            if let addSectionView = self.addSection.view {
++                if addSectionView.superview == nil {
++                    addSectionView.layer.allowsGroupOpacity = true
++                    self.scrollView.addSubview(addSectionView)
++                }
++                transition.setFrame(view: addSectionView, frame: addSectionFrame)
++                alphaTransition.setAlpha(view: addSectionView, alpha: self.isEnabled ? 1.0 : 0.0)
++                addSectionView.isUserInteractionEnabled = self.isEnabled
++            }
++            windowsHeight += addSectionSize.height
++
++            if self.isEnabled {
++                contentHeight += windowsHeight
++            }
++            contentHeight += bottomContentInset
++            contentHeight += environment.safeInsets.bottom
++
++            let previousBounds = self.scrollView.bounds
++            let contentSize = CGSize(width: availableSize.width, height: contentHeight)
++            if self.scrollView.frame != CGRect(origin: CGPoint(), size: availableSize) {
++                self.scrollView.frame = CGRect(origin: CGPoint(), size: availableSize)
++            }
++            if self.scrollView.contentSize != contentSize {
++                self.scrollView.contentSize = contentSize
++            }
++            let scrollInsets = UIEdgeInsets(top: environment.navigationHeight, left: 0.0, bottom: 0.0, right: 0.0)
++            if self.scrollView.verticalScrollIndicatorInsets != scrollInsets {
++                self.scrollView.verticalScrollIndicatorInsets = scrollInsets
++            }
++            if !previousBounds.isEmpty, !transition.animation.isImmediate {
++                let bounds = self.scrollView.bounds
++                if bounds.maxY != previousBounds.maxY {
++                    let offsetY = previousBounds.maxY - bounds.maxY
++                    transition.animateBoundsOrigin(view: self.scrollView, from: CGPoint(x: 0.0, y: offsetY), to: CGPoint(), additive: true)
++                }
++            }
++
++            self.topOverscrollLayer.frame = CGRect(origin: CGPoint(x: 0.0, y: -3000.0), size: CGSize(width: availableSize.width, height: 3000.0))
++
++            return availableSize
++        }
++    }
++
++    func makeView() -> View {
++        return View()
++    }
++
++    func update(view: View, availableSize: CGSize, state: EmptyComponentState, environment: Environment<EnvironmentType>, transition: ComponentTransition) -> CGSize {
++        return view.update(component: self, availableSize: availableSize, state: state, environment: environment, transition: transition)
++    }
++}
++
++public final class FolderNotificationScheduleScreen: ViewControllerComponentContainer {
++    private let isModal: Bool
++
++    // `completion` gets the new quiet hours when the user leaves the screen with changes. Pushed inside a
++    // modal sheet such as Edit Folder, the screen takes `.modal` to match the sheet's background.
++    public init(context: AccountContext, folderTitle: ChatFolderTitle, initialEntry: FolderNotificationScheduleEntry?, presentationMode: ViewControllerComponentContainer.PresentationMode = .default, completion: @escaping (FolderNotificationScheduleEntry) -> Void) {
++        if case .modal = presentationMode {
++            self.isModal = true
++        } else {
++            self.isModal = false
++        }
++        super.init(context: context, component: FolderNotificationScheduleScreenComponent(
++            context: context,
++            folderTitle: folderTitle,
++            initialEntry: initialEntry,
++            completion: completion
++        ), navigationBarAppearance: .default, presentationMode: presentationMode, theme: .default, updatedPresentationData: nil)
++
++        let presentationData = context.sharedContext.currentPresentationData.with { $0 }
++        self.title = ""
++        self.navigationItem.backBarButtonItem = UIBarButtonItem(title: presentationData.strings.Common_Back, style: .plain, target: nil, action: nil)
++
++        self.scrollToTop = { [weak self] in
++            guard let self, let componentView = self.node.hostView.componentView as? FolderNotificationScheduleScreenComponent.View else {
++                return
++            }
++            componentView.scrollToTop()
++        }
++    }
++
++    required public init(coder aDecoder: NSCoder) {
++        fatalError("init(coder:) has not been implemented")
++    }
++
++    // Saves once the screen is gone, so a swipe back that is cancelled changes nothing and the toast shows on the
++    // screen the user returns to.
++    override public func viewDidDisappear(_ animated: Bool) {
++        super.viewDidDisappear(animated)
++
++        if let componentView = self.node.hostView.componentView as? FolderNotificationScheduleScreenComponent.View {
++            componentView.save()
++        }
++    }
++
++    override public func preferredContentSizeForLayout(_ layout: ContainerViewLayout) -> CGSize? {
++        // Inside a modal sheet the sheet keeps its own size.
++        guard layout.metrics.widthClass == .regular, !self.isModal else {
++            return nil
++        }
++        return CGSize(
++            width: min(480.0, layout.size.width - 20.0),
++            height: min(layout.size.width, layout.size.height) - 88.0
++        )
++    }
++}
+diff --git a/submodules/TelegramUI/Components/Settings/FolderNotificationScheduleScreen/Sources/FolderNotificationScheduleText.swift b/submodules/TelegramUI/Components/Settings/FolderNotificationScheduleScreen/Sources/FolderNotificationScheduleText.swift
+new file mode 100644
+index 00000000..ded223e6
+--- /dev/null
++++ b/submodules/TelegramUI/Components/Settings/FolderNotificationScheduleScreen/Sources/FolderNotificationScheduleText.swift
+@@ -0,0 +1,111 @@
++import Foundation
++import TelegramPresentationData
++import TelegramStringFormatting
++import TextFormat
++import FolderNotificationSchedule
++
++// Short weekday names in the schedule's Monday-first order.
++public func folderNotificationScheduleShortDayNames(strings: PresentationStrings) -> [String] {
++    return [
++        strings.Weekday_ShortMonday,
++        strings.Weekday_ShortTuesday,
++        strings.Weekday_ShortWednesday,
++        strings.Weekday_ShortThursday,
++        strings.Weekday_ShortFriday,
++        strings.Weekday_ShortSaturday,
++        strings.Weekday_ShortSunday
++    ]
++}
++
++public func folderNotificationScheduleFullDayNames(strings: PresentationStrings) -> [String] {
++    return [
++        strings.Weekday_Monday,
++        strings.Weekday_Tuesday,
++        strings.Weekday_Wednesday,
++        strings.Weekday_Thursday,
++        strings.Weekday_Friday,
++        strings.Weekday_Saturday,
++        strings.Weekday_Sunday
++    ]
++}
++
++public func folderNotificationScheduleTimeText(minute: Int32, dateTimeFormat: PresentationDateTimeFormat) -> String {
++    let minute = minute % FolderNotificationSchedule.minutesPerDay
++    return stringForShortTimestamp(hours: minute / 60, minutes: minute % 60, dateTimeFormat: dateTimeFormat)
++}
++
++// "Every Day", "Weekdays", "Weekends", "Mon–Thu" for a run of three or more days (also across the end of
++// the week, "Fri–Mon"), else "Mon, Wed, Fri".
++public func folderNotificationScheduleDaysText(_ days: FolderNotificationSchedule.Days, strings: PresentationStrings) -> String {
++    if days == .everyDay {
++        return strings.FolderQuietHours_EveryDay
++    }
++    if days == .weekdays {
++        return strings.FolderQuietHours_Weekdays
++    }
++    if days == .weekends {
++        return strings.FolderQuietHours_Weekends
++    }
++    let names = folderNotificationScheduleShortDayNames(strings: strings)
++    // Start at a day that does not continue a run from the day before, so a run can wrap past Sunday.
++    guard let first = (0 ..< 7).first(where: { days.contains(dayIndex: $0) && !days.contains(dayIndex: ($0 + 6) % 7) }) else {
++        return ""
++    }
++    let indices = (0 ..< 7).map { (first + $0) % 7 }.filter { days.contains(dayIndex: $0) }
++    var parts: [String] = []
++    var index = 0
++    while index < indices.count {
++        var end = index
++        while end + 1 < indices.count && indices[end + 1] == (indices[end] + 1) % 7 {
++            end += 1
++        }
++        if end - index >= 2 {
++            parts.append("\(names[indices[index]])–\(names[indices[end]])")
++        } else {
++            for i in index ... end {
++                parts.append(names[indices[i]])
++            }
++        }
++        index = end + 1
++    }
++    return parts.joined(separator: ", ")
++}
++
++// "Weekdays, 19:00 – 09:00" or "Weekends, All Day". All Day is midnight to midnight; equal times
++// elsewhere are 24 hours from that time and are written out.
++public func folderNotificationScheduleWindowText(_ schedule: FolderNotificationSchedule, strings: PresentationStrings, dateTimeFormat: PresentationDateTimeFormat) -> String {
++    let days = folderNotificationScheduleDaysText(schedule.days, strings: strings)
++    if schedule.isWholeDay && schedule.startMinute == 0 {
++        return "\(days), \(strings.FolderQuietHours_AllDay)"
++    }
++    let start = folderNotificationScheduleTimeText(minute: schedule.startMinute, dateTimeFormat: dateTimeFormat)
++    let end = folderNotificationScheduleTimeText(minute: schedule.endMinute, dateTimeFormat: dateTimeFormat)
++    return "\(days), \(start)\u{00a0}– \(end)"
++}
++
++// What a folder's quiet hours are, in full; nil when they are off.
++public func folderNotificationScheduleSummary(_ entry: FolderNotificationScheduleEntry?, strings: PresentationStrings, dateTimeFormat: PresentationDateTimeFormat) -> String? {
++    guard let entry, entry.isEnabled, !entry.schedules.isEmpty else {
++        return nil
++    }
++    return entry.schedules.map { folderNotificationScheduleWindowText($0, strings: strings, dateTimeFormat: dateTimeFormat) }.joined(separator: "; ")
++}
++
++// Where quiet hours stand, for the folder tab's menu and the Edit Folder row: "Until 09:00" while they are
++// on, "From 19:00" while they are off, with the weekday when that is a day or more away ("Until Mon 09:00");
++// nil when they are switched off.
++public func folderNotificationScheduleStatus(_ entry: FolderNotificationScheduleEntry?, at date: Date, calendar: Calendar, strings: PresentationStrings, dateTimeFormat: PresentationDateTimeFormat) -> String? {
++    guard let entry, entry.isEnabled, !entry.schedules.isEmpty else {
++        return nil
++    }
++    guard let change = entry.nextTransition(after: date, calendar: calendar) else {
++        return entry.isActive(at: date, calendar: calendar) ? strings.FolderQuietHours_StatusAlways : nil
++    }
++    let position = FolderNotificationSchedule.position(of: change, calendar: calendar)
++    var time = folderNotificationScheduleTimeText(minute: position.minute, dateTimeFormat: dateTimeFormat)
++    if change.timeIntervalSince(date) >= 24.0 * 60.0 * 60.0 {
++        time = "\(folderNotificationScheduleShortDayNames(strings: strings)[position.dayIndex]) \(time)"
++    }
++    let template = entry.isActive(at: date, calendar: calendar) ? strings.FolderQuietHours_StatusUntil : strings.FolderQuietHours_StatusFrom
++    return template.replacingOccurrences(of: "{time}", with: time)
++}
+diff --git a/submodules/TelegramUI/Sources/AccountContext.swift b/submodules/TelegramUI/Sources/AccountContext.swift
+index b264bc03..82749d7e 100644
+--- a/submodules/TelegramUI/Sources/AccountContext.swift
++++ b/submodules/TelegramUI/Sources/AccountContext.swift
+@@ -31,6 +31,7 @@ import WalletContext
+ import WalletConnectScreen
+ import AlertUI
+ import MetalEngine
++import ChatListUI
+ 
+ private final class DeviceSpecificContactImportContext {
+     let disposable = MetaDisposable()
+@@ -151,6 +152,7 @@ public final class AccountContextImpl: AccountContext {
+ 
+     public let twoStepAuthData = Promise<TwoStepAuthData?>(nil)
+     public let giftAuctionsManager: GiftAuctionsManager?
++    let folderNotificationScheduleManager: FolderNotificationScheduleManager?
+     
+     public let peerChannelMemberCategoriesContextsManager = PeerChannelMemberCategoriesContextsManager()
+     
+@@ -368,6 +370,7 @@ public final class AccountContextImpl: AccountContext {
+                 applicationIsPasscodeLocked: sharedContext.appLockContext.isPasscodeLocked
+             )
+             self.giftAuctionsManager = GiftAuctionsManager(account: account)
++            self.folderNotificationScheduleManager = FolderNotificationScheduleManager(engine: self.engine)
+         } else {
+             self.prefetchManager = nil
+             self.wallpaperUploadManager = nil
+@@ -377,6 +380,7 @@ public final class AccountContextImpl: AccountContext {
+             self.tonContext = nil
+             self.walletContext = nil
+             self.giftAuctionsManager = nil
++            self.folderNotificationScheduleManager = nil
+         }
+         
+         self.account.stateManager.starsContext = self.starsContext
+diff --git a/submodules/TelegramUI/Sources/AppDelegate.swift b/submodules/TelegramUI/Sources/AppDelegate.swift
+index 1ceb46bc..49ffe508 100644
+--- a/submodules/TelegramUI/Sources/AppDelegate.swift
++++ b/submodules/TelegramUI/Sources/AppDelegate.swift
+@@ -3229,7 +3229,12 @@ private func extractAccountManagerState(records: AccountRecordsView<TelegramAcco
+         |> deliverOnMainQueue).start(next: { accountId in
+             if let context = self.contextValue {
+                 if let accountId = accountId, context.context.account.id != accountId || notification.request.content.userInfo["url"] != nil {
+-                    completionHandler([.banner, .list])
++                    if notification.request.content.interruptionLevel == .passive {
++                        // Made passive by the notification service extension (folder quiet hours): no banner.
++                        completionHandler([.list])
++                    } else {
++                        completionHandler([.banner, .list])
++                    }
+                 }
+             }
+         })
+diff --git a/submodules/TelegramUI/Sources/ApplicationContext.swift b/submodules/TelegramUI/Sources/ApplicationContext.swift
+index fe34b998..b11a5ac2 100644
+--- a/submodules/TelegramUI/Sources/ApplicationContext.swift
++++ b/submodules/TelegramUI/Sources/ApplicationContext.swift
+@@ -366,9 +366,10 @@ final class AuthorizedApplicationContext {
+                     }
+                     
+                     if let appLockContext = strongSelf.context.sharedContext.appLockContext as? AppLockContextImpl {
+-                        let _ = (appLockContext.isCurrentlyLocked
+-                        |> take(1)
+-                        |> deliverOnMainQueue).start(next: { locked in
++                        // Folder quiet hours: the chat stays silent, as if muted — no sound, no banner.
++                        let isQuiet = strongSelf.context.folderNotificationScheduleManager?.isQuiet(peerId: firstMessage.id.peerId) ?? .single(false)
++                        let _ = (combineLatest(appLockContext.isCurrentlyLocked |> take(1), isQuiet)
++                        |> deliverOnMainQueue).start(next: { locked, isQuiet in
+                             guard let strongSelf = self else {
+                                 return
+                             }
+@@ -376,6 +377,9 @@ final class AuthorizedApplicationContext {
+                             guard !locked else {
+                                 return
+                             }
++                            if isQuiet {
++                                return
++                            }
+                             let isMuted = firstMessage.attributes.contains(where: { attribute in
+                                 if let attribute = attribute as? NotificationInfoMessageAttribute {
+                                     return attribute.flags.contains(.muted)
+diff --git a/submodules/TelegramUIPreferences/BUILD b/submodules/TelegramUIPreferences/BUILD
+index a68d0316..60d202b2 100644
+--- a/submodules/TelegramUIPreferences/BUILD
++++ b/submodules/TelegramUIPreferences/BUILD
+@@ -12,6 +12,7 @@ swift_library(
+     deps = [
+         "//submodules/TelegramCore:TelegramCore",
+         "//submodules/SSignalKit/SwiftSignalKit:SwiftSignalKit",
++        "//submodules/FolderNotificationSchedule",
+     ],
+     visibility = [
+         "//visibility:public",
+diff --git a/submodules/TelegramUIPreferences/Sources/ChatListFolderNotificationScheduleSettings.swift b/submodules/TelegramUIPreferences/Sources/ChatListFolderNotificationScheduleSettings.swift
+new file mode 100644
+index 00000000..c31b71fd
+--- /dev/null
++++ b/submodules/TelegramUIPreferences/Sources/ChatListFolderNotificationScheduleSettings.swift
+@@ -0,0 +1,90 @@
++import Foundation
++import SwiftSignalKit
++import TelegramCore
++import FolderNotificationSchedule
++
++// Quiet hours of an account's chat folders.
++//
++// Kept on this device, like the other app-specific preferences: the server has no notification settings
++// for folders, and a schedule follows the device's clock. Quiet hours never change a chat's own
++// notification settings; they only keep the chats of a folder silent while a window is on. Which chats
++// that is, is decided when a notification arrives, by the folder's rules at that moment
++// (`TelegramEngine.Peers.chatListFiltersIncludePeer`).
++public struct ChatListFolderNotificationScheduleSettings: Equatable, Codable {
++    public struct Folder: Equatable, Codable {
++        public var id: Int32
++        public var entry: FolderNotificationScheduleEntry
++
++        public init(id: Int32, entry: FolderNotificationScheduleEntry) {
++            self.id = id
++            self.entry = entry
++        }
++
++        public init(from decoder: Decoder) throws {
++            let container = try decoder.container(keyedBy: StringCodingKey.self)
++            self.id = try container.decode(Int32.self, forKey: "id")
++            self.entry = try container.decode(FolderNotificationScheduleEntry.self, forKey: "entry")
++        }
++
++        public func encode(to encoder: Encoder) throws {
++            var container = encoder.container(keyedBy: StringCodingKey.self)
++            try container.encode(self.id, forKey: "id")
++            try container.encode(self.entry, forKey: "entry")
++        }
++    }
++
++    public var folders: [Folder]
++
++    public static var `default`: ChatListFolderNotificationScheduleSettings {
++        return ChatListFolderNotificationScheduleSettings(folders: [])
++    }
++
++    public init(folders: [Folder]) {
++        self.folders = folders
++    }
++
++    public init(from decoder: Decoder) throws {
++        let container = try decoder.container(keyedBy: StringCodingKey.self)
++        self.folders = try container.decodeIfPresent([Folder].self, forKey: "folders") ?? []
++    }
++
++    public func encode(to encoder: Encoder) throws {
++        var container = encoder.container(keyedBy: StringCodingKey.self)
++        try container.encode(self.folders, forKey: "folders")
++    }
++
++    public func folder(id: Int32) -> Folder? {
++        return self.folders.first(where: { $0.id == id })
++    }
++
++    public func withUpdatedEntry(folderId: Int32, entry: FolderNotificationScheduleEntry) -> ChatListFolderNotificationScheduleSettings {
++        var folders = self.folders
++        if let index = folders.firstIndex(where: { $0.id == folderId }) {
++            folders[index].entry = entry
++        } else {
++            folders.append(Folder(id: folderId, entry: entry))
++        }
++        return ChatListFolderNotificationScheduleSettings(folders: folders)
++    }
++
++    // The folders in quiet hours at `date`. A chat in several folders is quiet while any of them is.
++    public func activeFolderIds(at date: Date, calendar: Calendar) -> Set<Int32> {
++        var result = Set<Int32>()
++        for folder in self.folders where folder.entry.isActive(at: date, calendar: calendar) {
++            result.insert(folder.id)
++        }
++        return result
++    }
++}
++
++public func updateChatListFolderNotificationScheduleSettings(engine: TelegramEngine, _ f: @escaping (ChatListFolderNotificationScheduleSettings) -> ChatListFolderNotificationScheduleSettings) -> Signal<Never, NoError> {
++    return engine.preferences.update(id: ApplicationSpecificPreferencesKeys.chatListFolderNotificationSchedules, { entry in
++        let currentSettings: ChatListFolderNotificationScheduleSettings
++        if let entry = entry?.get(ChatListFolderNotificationScheduleSettings.self) {
++            currentSettings = entry
++        } else {
++            currentSettings = .default
++        }
++        return SharedPreferencesEntry(f(currentSettings))
++    })
++}
+diff --git a/submodules/TelegramUIPreferences/Sources/PostboxKeys.swift b/submodules/TelegramUIPreferences/Sources/PostboxKeys.swift
+index 516215ab..3a514eb2 100644
+--- a/submodules/TelegramUIPreferences/Sources/PostboxKeys.swift
++++ b/submodules/TelegramUIPreferences/Sources/PostboxKeys.swift
+@@ -12,6 +12,7 @@ private enum ApplicationSpecificPreferencesKeyValues: Int32 {
+     case walletState = 23
+     case qrStudioLook = 24
+     case qrStudioPeerLook = 25
++    case chatListFolderNotificationSchedules = 26
+ }
+ 
+ public struct ApplicationSpecificPreferencesKeys {
+@@ -23,6 +24,7 @@ public struct ApplicationSpecificPreferencesKeys {
+     public static let ageVerificationState: EngineDataBuffer = applicationSpecificPreferencesKey(ApplicationSpecificPreferencesKeyValues.ageVerificationState.rawValue)
+     public static let walletState: EngineDataBuffer = applicationSpecificPreferencesKey(ApplicationSpecificPreferencesKeyValues.walletState.rawValue)
+     public static let qrStudioLook: EngineDataBuffer = applicationSpecificPreferencesKey(ApplicationSpecificPreferencesKeyValues.qrStudioLook.rawValue)
++    public static let chatListFolderNotificationSchedules: EngineDataBuffer = applicationSpecificPreferencesKey(ApplicationSpecificPreferencesKeyValues.chatListFolderNotificationSchedules.rawValue)
+     
+     public static func qrStudioPeerLook(peerId: EnginePeer.Id) -> EngineDataBuffer {
+         let key = EngineDataBuffer(length: 4 + 8)

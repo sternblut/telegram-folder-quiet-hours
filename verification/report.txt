@@ -1,0 +1,8 @@
+Folder quiet hours self-check, 2026-10-25 16:25:51 +0000
+chats: 30 (bot: 1; bot archived muted: 1; bot muted unread: 1; bot unread: 2; channel: 6; channel archived: 1; channel muted: 1; channel unread: 1; forum: 1; group archived unread: 1; group muted unread: 1; group unread: 10; self: 1; supergroup: 1; support unread: 1)
+chat list holes or more chats than loaded: 0
+folder rules: 2048 single folders + 400 pairs of folders; checks: 73440
+notification path mismatches: 0
+chat list row mismatches (row in its own list): 0
+archived chat rows inside a folder tab (known limit): 576 of 6144
+account folders [2, 3, 4, 5], every set of quiet ones, _internal_chatListFiltersIncludePeer: 450 checks, mismatches 0
