@@ -5,6 +5,16 @@ chat rings as usual. Notifications come back on their own when quiet hours end.
 
 **Demo:** [`demo.mp4`](demo.mp4) — the real app in the iOS simulator, one take, cut where the screen is still.
 
+<p>
+<img src="screenshots/2-folder-menu.png" width="200" alt="The folder tab's menu: Quiet Hours, until 08:00">
+<img src="screenshots/3-quiet-hours.png" width="200" alt="The Quiet Hours screen: every day from 19:00 to 08:00">
+<img src="screenshots/4-two-sets.png" width="200" alt="A second set of hours: Saturday and Sunday, all day">
+<img src="screenshots/1-chat-list.png" width="200" alt="During quiet hours the Work folder's badges are grey; Personal stays blue">
+</p>
+
+The folder tab's menu, the Quiet Hours screen, a second set for the weekend, and the chat list during quiet hours:
+Work's badges are grey and its message arrived without a sound or banner, while Dad's, in Personal, rang as usual.
+
 Telegram already mutes a whole folder with one tap (**Mute All** in the folder tab's menu), but only until it is
 unmuted by hand. People keep asking for a folder mute that ends by itself or follows a schedule
 ([bugs.telegram.org/c/2411](https://bugs.telegram.org/c/2411)). Quiet Hours is that schedule, next to Mute All.
