@@ -6,10 +6,10 @@ notifies as usual. Notifications come back on their own when quiet hours end.
 A patch for Telegram-iOS, with tests. ▶︎ [Demo video](https://github.com/sternblut/telegram-folder-quiet-hours/raw/main/demo.mp4): the real app in the iOS simulator, 32 s.
 
 <p>
-<img src="screenshots/1-folder-menu.png" width="170" alt="Folder tab menu: Quiet Hours, until 08:00">
-<img src="screenshots/2-quiet-hours.png" width="170" alt="Quiet Hours: every day from 19:00 to 08:00">
-<img src="screenshots/3-two-sets.png" width="170" alt="A second set: Saturday and Sunday, all day">
-<img src="screenshots/4-chat-list.png" width="170" alt="Work badges gray during quiet hours, Personal blue">
+<img src="screenshots/1-folder-menu.png" width="155" alt="Folder tab menu: Quiet Hours, until 08:00">
+<img src="screenshots/2-quiet-hours.png" width="155" alt="Quiet Hours: every day from 19:00 to 08:00">
+<img src="screenshots/3-two-sets.png" width="155" alt="A second set: Saturday and Sunday, all day">
+<img src="screenshots/4-chat-list.png" width="155" alt="Work badges gray during quiet hours, Personal blue">
 </p>
 
 ## Why
