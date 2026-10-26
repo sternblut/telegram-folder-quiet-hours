@@ -2,7 +2,7 @@
 
 The tests in the patch cover the schedule math. Which chats a folder holds is a different question: Telegram
 decides it from the folder's chat types, included, excluded and pinned chats, archived chats and contacts. Quiet hours
-must silence exactly the chats the folder's tab shows, and grey exactly those badges, so this harness checks both
+must silence exactly the chats the folder's tab shows, and gray exactly those badges, so this harness checks both
 against Postbox's own chat list for the folder, on a real account.
 
 What it checks, inside the app:
@@ -15,9 +15,9 @@ What it checks, inside the app:
   the app and the notification service extension call.
 
 For each rule and each chat it compares the folder tab's own list (`tailChatListView` with the folder's predicate)
-with the notification path and with the chat list row's grey badge. [`report.txt`](report.txt) is the run of
+with the notification path and with the chat list row's gray badge. [`report.txt`](report.txt) is the run of
 25 October 2026 on the demo account: 30 chats of 13 kinds, 73,440 checks and 450 checks, no mismatches. The one known
-limit of the prototype shows up as expected: an archived chat inside a folder tab takes its badge colour by the rules
+limit of the prototype shows up as expected: an archived chat inside a folder tab takes its badge color by the rules
 for unarchived chats, as Telegram's folder tags do (its notifications are right).
 
 ## Running it
